@@ -21,33 +21,31 @@ jobs:
           HF_SPACE_NAME: AI_Assistent_v8
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          # 1. Configurações Globais
+          # 1. Configura o Git
           git config --global --add safe.directory '*'
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # 2. Instala LFS
+          # 2. Instala e Configura o LFS
           git lfs install
           
-          # 3. Garante que o .gitattributes existe e rastreia PDFs
-          # Isso sobrescreve qualquer configuração anterior para garantir
-          echo "*.pdf filter=lfs diff=lfs merge=lfs -text" > .gitattributes
+          # --- CORREÇÃO DO ERRO DO PDF ---
+          # Cria/Atualiza o arquivo .gitattributes para rastrear PDFs
+          echo "knowledge/*.pdf filter=lfs diff=lfs merge=lfs -text" >> .gitattributes
           
-          # 4. A MÁGICA (Branch Órfã)
-          # Cria uma nova branch temporária sem NENHUM histórico passado
-          git checkout --orphan temporary_clean_branch
+          # Rastrea explicitamente todos os PDFs na pasta knowledge
+          git lfs track "knowledge/*.pdf"
           
-          # Adiciona todos os arquivos atuais (agora respeitando o LFS)
-          git add --all
+          # Força o Git a re-ler o PDF agora usando LFS
+          git add .gitattributes
+          git add --renormalize knowledge/*.pdf
           
-          # Cria um único commit limpo
-          git commit -m "Sincronização forçada e limpa (LFS Fix)"
+          # Cria um commit temporário com essa correção
+          git commit -m "Convertendo PDF para LFS automaticamente" || echo "Nada para commitar"
+          # -------------------------------
           
-          # 5. Configura o Remote
+          # 3. Adiciona o remote
           git remote add hf https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE_NAME}
           
-          # 6. Envia esmagando o histórico do Hugging Face (Force Push)
-          # Envia a branch temporária para a main do Hugging Face
-          git push hf temporary_clean_branch:main --force
-          
-          echo "✅ Sincronização concluída com sucesso! Histórico limpo enviado."
+          # 4. Push final
+          git push hf HEAD:main --force --verbose
