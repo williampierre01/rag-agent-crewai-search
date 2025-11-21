@@ -13,12 +13,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          lfs: true  # <--- ADICIONADO: Isso baixa os arquivos grandes corretamente
-
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          lfs: true
 
       - name: Push to Hugging Face Space
         env:
@@ -26,13 +21,20 @@ jobs:
           HF_SPACE_NAME: AI_Assistent_v8
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          # Habilita o LFS explicitamente para o push
+          # 1. CORREÇÃO CRÍTICA: Desativa a trava de segurança de diretório do Git
+          git config --global --add safe.directory '*'
+          
+          # 2. Configurações básicas
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 3. Garante instalação do LFS
           git lfs install
           
-          # Adiciona o remote
+          # 4. Adiciona o remote com o Token
           git remote add hf https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE_NAME}
           
-          # Push com force para garantir a sincronia
-          git push hf main --force
-          
-          echo "Sincronização concluída!"
+          # 5. Push Explícito e Verboso
+          # Usar HEAD:main garante que o commit atual seja enviado para a main remota
+          # --verbose ajuda a ver o erro no log se falhar
+          git push hf HEAD:main --force --verbose
