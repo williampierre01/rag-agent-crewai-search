@@ -1,10 +1,3 @@
-# routing_task:
-#   description: >
-#     Understand the user query: {query}, and route it to the most appropriate knowledge base
-#   expected_output: >
-#     The most appropriate knowledge base to route the user query to, the answer should be either 'pdf_search' or 'pdf_search'
-#   agent: routing_agent
-
 retrieval_task:
   description: >
     Retrieve the most relevant information from the available sources for the user query: {query}

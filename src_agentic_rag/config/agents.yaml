@@ -1,11 +1,3 @@
-# routing_agent:
-#   role: >
-#     Understand the user query: {query}, and route it to the most appropriate knowledge base
-#   goal: >
-#     Route user queries to the most appropriate knowledge base
-#   backstory: >
-#     You are a user query routing agent. You are knowln for your ability to carefully understand user queries and route them to the most appropriate knowledge base.
-
 retriever_agent:
   role: >
     Retrieve relevant information to answer the user query: {query}
