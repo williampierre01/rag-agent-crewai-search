@@ -21,20 +21,31 @@ jobs:
           HF_SPACE_NAME: AI_Assistent_v8
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          # 1. CORREÇÃO CRÍTICA: Desativa a trava de segurança de diretório do Git
+          # 1. Configura o Git
           git config --global --add safe.directory '*'
-          
-          # 2. Configurações básicas
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # 3. Garante instalação do LFS
+          # 2. Instala e Configura o LFS
           git lfs install
           
-          # 4. Adiciona o remote com o Token
+          # --- CORREÇÃO DO ERRO DO PDF ---
+          # Cria/Atualiza o arquivo .gitattributes para rastrear PDFs
+          echo "knowledge/*.pdf filter=lfs diff=lfs merge=lfs -text" >> .gitattributes
+          
+          # Rastrea explicitamente todos os PDFs na pasta knowledge
+          git lfs track "knowledge/*.pdf"
+          
+          # Força o Git a re-ler o PDF agora usando LFS
+          git add .gitattributes
+          git add --renormalize knowledge/*.pdf
+          
+          # Cria um commit temporário com essa correção
+          git commit -m "Convertendo PDF para LFS automaticamente" || echo "Nada para commitar"
+          # -------------------------------
+          
+          # 3. Adiciona o remote
           git remote add hf https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE_NAME}
           
-          # 5. Push Explícito e Verboso
-          # Usar HEAD:main garante que o commit atual seja enviado para a main remota
-          # --verbose ajuda a ver o erro no log se falhar
+          # 4. Push final
           git push hf HEAD:main --force --verbose
