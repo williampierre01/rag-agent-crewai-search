@@ -1,5 +1,6 @@
 crewai[tools]
 markitdown
+chonkie
 firecrawl-py
 transformers
 accelerate
