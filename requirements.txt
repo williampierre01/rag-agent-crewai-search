@@ -8,4 +8,4 @@ accelerate
 bitsandbytes
 langchain-community
 qdrant-client
-
+spaces
