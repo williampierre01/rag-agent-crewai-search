@@ -1,4 +1,4 @@
-crewai[tools]>=0.86.0,<1.0.0
+crewai
 transformers
 accelerate
 bitsandbytes
