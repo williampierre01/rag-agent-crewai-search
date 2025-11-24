@@ -28,10 +28,10 @@ from src.agentic_rag.tools.custom_tool import DocumentSearchTool
 # model_name = "mistralai/Mistral-7B-Instruct-v0.3"
 
 # Exemplo 4: Mais rápido (microsoft/Phi-3.5-mini-instruct)
-# model_name = "microsoft/Phi-3.5-mini-instruct"
+model_name = "microsoft/Phi-3.5-mini-instruct"
 
 # Exemplo 5: Treinado para agente (NousResearch/Hermes-3-Llama-3.1-8B) - recomendado usar versão quantizada
-model_name = "NousResearch/Hermes-3-Llama-3.1-8B"
+#model_name = "NousResearch/Hermes-3-Llama-3.1-8B"
 
 print(f"Carregando o modelo: {model_name}")
 
