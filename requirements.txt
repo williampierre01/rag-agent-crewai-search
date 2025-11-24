@@ -7,3 +7,4 @@ accelerate
 bitsandbytes
 langchain-community
 qdrant-client
+flash_attn
