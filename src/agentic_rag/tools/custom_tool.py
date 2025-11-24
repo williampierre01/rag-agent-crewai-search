@@ -5,6 +5,12 @@ from pydantic import BaseModel, Field, ConfigDict
 from markitdown import MarkItDown
 from chonkie import SemanticChunker
 from qdrant_client import QdrantClient
+from crewai_tools import FirecrawlSearchTool
+
+
+class FireCrawlWebSearchTool(FirecrawlSearchTool):
+    name: str = "FireCrawlWebSearchTool"
+    description: str = "Uma ferramenta para pesquisar na web usando FireCrawl."
 
 class DocumentSearchToolInput(BaseModel):
     """Input schema for DocumentSearchTool."""
