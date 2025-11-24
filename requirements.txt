@@ -1,4 +1,6 @@
 crewai[tools]
+markitdown
+firecrawl-py
 transformers
 accelerate
 bitsandbytes
