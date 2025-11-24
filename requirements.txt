@@ -1,4 +1,5 @@
-crewai[tools]
+crewai
+crewai-tools
 markitdown
 chonkie
 firecrawl-py
@@ -7,4 +8,4 @@ accelerate
 bitsandbytes
 langchain-community
 qdrant-client
-flash_attn
+
