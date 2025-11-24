@@ -2,6 +2,7 @@ import gradio as gr
 import os
 import time
 import gc
+import spaces
 from crewai import Agent, Crew, Process, Task
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig # Adicionado AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch # Adicionado torch
@@ -174,6 +175,7 @@ def process_pdf(file_obj):
     except Exception as e:
         return None, f"Erro ao indexar PDF: {str(e)}", None
 
+@spaces.GPU
 def chat_function(message, history, pdf_tool_state, crew_state):
     """
     Função principal do chat.
