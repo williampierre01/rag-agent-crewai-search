@@ -109,9 +109,12 @@ def load_llm():
     # 2. Converte Pipeline em LangChain LLM
     hf_pipeline = HuggingFacePipeline(pipeline=text_generation_pipeline)
 
-    # 3. MÁGICA: Passamos o model_id explicitamente!
-    # Isso permite que ele ache o template correto e não tente o fallback.
-    global_llm = ChatHuggingFace(llm=hf_pipeline, model_id=model_name)
+    # 3. CORREÇÃO CRÍTICA: Passamos o tokenizer explicitamente
+    # Isso impede o erro "Fallback to LiteLLM"
+    global_llm = ChatHuggingFace(
+        llm=hf_pipeline, 
+        tokenizer=tokenizer  # <--- LINHA NOVA IMPORTANTE
+    )
     
     return global_llm
 
@@ -201,7 +204,7 @@ def chat_function(message, history):
     yield history
 
 with gr.Blocks(title="RAG Local Final") as demo:
-    gr.Markdown("# 🛡️ RAG Local (ChatWrapper Fix)")
+    gr.Markdown("# 🛡️ RAG Local (Tokenizer Fix)")
     with gr.Row():
         upl = gr.File(label="PDF")
         st = gr.Markdown("...")
