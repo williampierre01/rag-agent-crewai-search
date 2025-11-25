@@ -8,6 +8,7 @@ from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndB
 import torch
 from langchain_community.llms import HuggingFacePipeline
 
+# Certifique-se de que os imports das suas tools customizadas estão corretos
 from src.agentic_rag.tools.custom_tool import FireCrawlWebSearchTool
 from src.agentic_rag.tools.custom_tool import DocumentSearchTool
 
@@ -73,16 +74,27 @@ def load_llm():
 # ===========================
 #   Definição de Agentes e Tarefas
 # ===========================
-# Adicionado decorador GPU aqui também, pois esta função chama load_llm
+
+# ALTERAÇÃO IMPORTANTE: Agora recebe o CAMINHO do PDF (string), não a ferramenta pronta.
 @spaces.GPU(duration=120) 
-def create_agents_and_tasks(pdf_tool):
-    """Cria a Crew com a ferramenta de PDF (se houver) e busca na web."""
+def create_agents_and_tasks(pdf_path_str):
+    """Cria a Crew instanciando a ferramenta de PDF aqui dentro (seguro para GPU)."""
+    
     web_search_tool = FireCrawlWebSearchTool()
 
-    # Lista de ferramentas
-    tools_list = [t for t in [pdf_tool, web_search_tool] if t]
+    # Lista de ferramentas base
+    tools_list = [web_search_tool]
 
-    # Carregar o LLM (agora seguro pois estamos dentro de @spaces.GPU)
+    # SE houver um PDF, cria a ferramenta AGORA, dentro do processo da GPU
+    if pdf_path_str:
+        print(f"Criando ferramenta para o PDF: {pdf_path_str}")
+        try:
+            pdf_tool = DocumentSearchTool(file_path=pdf_path_str)
+            tools_list.append(pdf_tool)
+        except Exception as e:
+            print(f"Erro ao criar ferramenta de PDF: {e}")
+
+    # Carregar o LLM
     llm_instance = load_llm()
 
     retriever_agent = Agent(
@@ -131,36 +143,35 @@ def create_agents_and_tasks(pdf_tool):
 #   Funções de Lógica do Gradio
 # ===========================
 
-# ADICIONADO: @spaces.GPU aqui é CRUCIAL para o SentenceTransformers (Embeddings)
-@spaces.GPU 
 def process_pdf(file_obj):
     """
     Processa o arquivo PDF enviado pelo usuário.
+    ALTERAÇÃO: Retorna apenas o CAMINHO do arquivo (string), evitando PicklingError.
     """
     if not file_obj:
         return None, "Nenhum arquivo enviado.", None
 
     try:
+        # Pega o caminho
         file_path = file_obj.name if hasattr(file_obj, 'name') else file_obj
         
-        # O DocumentSearchTool carrega embeddings, então precisa de GPU
-        doc_tool = DocumentSearchTool(file_path=file_path)
-        
-        return doc_tool, f"PDF '{os.path.basename(file_path)}' indexado com sucesso!", None
+        # Retorna o CAMINHO, não o objeto
+        return file_path, f"PDF '{os.path.basename(file_path)}' pronto para análise!", None
     except Exception as e:
-        return None, f"Erro ao indexar PDF: {str(e)}", None
+        return None, f"Erro ao processar PDF: {str(e)}", None
 
 @spaces.GPU(duration=120)
-def chat_function(message, history, pdf_tool_state, crew_state):
+def chat_function(message, history, pdf_path_state, crew_state):
     """
     Função principal do chat.
+    pdf_path_state: Agora é uma string (caminho do arquivo)
     """
     if not message:
         return history, crew_state
 
-    # Se a Crew não existir, criamos uma nova
+    # Se a Crew não existir, criamos uma nova passando o CAMINHO do PDF
     if crew_state is None:
-        crew_state = create_agents_and_tasks(pdf_tool_state)
+        crew_state = create_agents_and_tasks(pdf_path_state)
 
     inputs = {"query": message}
 
@@ -175,11 +186,10 @@ def chat_function(message, history, pdf_tool_state, crew_state):
     
     # Exibir resposta gradualmente
     full_text = ""
-    # Se final_response for muito curto ou não iterável, tratamos aqui
-    for char in final_response: # Iterar por char fica mais suave que por linha
+    for char in final_response:
         full_text += char
         history[-1] = (message, full_text)
-        if len(full_text) % 5 == 0: # Atualiza a cada 5 caracteres para não travar a UI
+        if len(full_text) % 5 == 0:
             yield history, crew_state
             time.sleep(0.001)
             
@@ -194,8 +204,9 @@ def chat_function(message, history, pdf_tool_state, crew_state):
 
 with gr.Blocks(title="Agentic RAG com CrewAI") as demo:
 
-    pdf_tool_state = gr.State(None)
-    crew_state = gr.State(None)
+    # Estados
+    pdf_path_state = gr.State(None) # Armazena String (caminho)
+    crew_state = gr.State(None)     # Armazena Objeto Crew
 
     gr.Markdown("# Agentic RAG powered by CrewAI")
 
@@ -210,15 +221,17 @@ with gr.Blocks(title="Agentic RAG com CrewAI") as demo:
             chatbot = gr.Chatbot(label="Histórico", height=600)
             msg_input = gr.Textbox(label="Pergunta", placeholder="Digite aqui...")
 
+    # Evento de Upload
     file_upload.change(
         fn=process_pdf,
         inputs=[file_upload],
-        outputs=[pdf_tool_state, upload_status, crew_state]
+        outputs=[pdf_path_state, upload_status, crew_state] # Atualiza o caminho e reseta a crew
     )
 
+    # Evento de Enviar Mensagem
     msg_input.submit(
         fn=chat_function,
-        inputs=[msg_input, chatbot, pdf_tool_state, crew_state],
+        inputs=[msg_input, chatbot, pdf_path_state, crew_state],
         outputs=[chatbot, crew_state]
     ).then(
         fn=lambda: "", outputs=[msg_input]
