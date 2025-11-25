@@ -213,7 +213,7 @@ with gr.Blocks(title="Agentic RAG com CrewAI") as demo:
             clear_btn = gr.Button("🗑️ Limpar Conversa")
 
         with gr.Column(scale=4):
-            chatbot = gr.Chatbot(label="Chat", height=600, type="messages")
+            chatbot = gr.Chatbot(label="Chat", height=600)
             # Nota: type="messages" é o novo padrão, mas se der erro visual, remova esse parametro.
             
             msg_input = gr.Textbox(label="Sua Pergunta", placeholder="Digite aqui e pressione Enter...")
