@@ -222,4 +222,24 @@ with gr.Blocks(title="Agentic RAG com CrewAI") as demo:
     file_upload.change(
         fn=process_pdf,
         inputs=[file_upload],
-        outputs=[pdf
+        outputs=[pdf_path_state, upload_status]
+    )
+
+    msg_input.submit(
+        fn=chat_function,
+        inputs=[msg_input, chatbot, pdf_path_state],
+        outputs=[chatbot]
+    ).then(
+        fn=lambda: "", outputs=[msg_input] # Limpa caixa de texto
+    )
+
+    def reset_chat():
+        return []
+
+    clear_btn.click(
+        fn=reset_chat,
+        outputs=[chatbot]
+    )
+
+if __name__ == "__main__":
+    demo.launch()
