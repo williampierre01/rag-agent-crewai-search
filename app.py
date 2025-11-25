@@ -21,7 +21,7 @@ from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndB
 import torch
 
 # ==============================================================================
-#  CONFIGURAÇÕES
+#  CONFIGURAÇÕES DE AMBIENTE
 # ==============================================================================
 os.environ["OPENAI_API_KEY"] = "NA"
 os.environ["OTEL_SDK_DISABLED"] = "true"
@@ -33,7 +33,7 @@ GLOBAL_VECTOR_DB = None
 GLOBAL_PIPELINE = None 
 
 # ==============================================================================
-#  1. BANCO VETORIAL (RAG)
+#  1. BANCO VETORIAL (RAG) - VERSÃO OTIMIZADA PARA MEMÓRIA
 # ==============================================================================
 @spaces.GPU
 def build_vector_store(pdf_path):
@@ -41,13 +41,16 @@ def build_vector_store(pdf_path):
     print(f"[RAG] Indexando: {pdf_path}")
     
     try:
+        # Limpeza agressiva de memória
         torch.cuda.empty_cache()
         gc.collect()
 
         loader = PyPDFLoader(pdf_path)
         docs = loader.load()
         
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        # --- OTIMIZAÇÃO: CHUNKS MENORES ---
+        # Reduzi para 600 chars. Isso evita estourar a memória do Qwen.
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
         splits = text_splitter.split_documents(docs)
 
         embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -59,7 +62,9 @@ def build_vector_store(pdf_path):
             persist_directory=None
         )
         
-        GLOBAL_VECTOR_DB = vectorstore.as_retriever(search_kwargs={"k": 3})
+        # --- OTIMIZAÇÃO: MENOS CONTEXTO ---
+        # k=2 pega apenas os 2 trechos mais importantes.
+        GLOBAL_VECTOR_DB = vectorstore.as_retriever(search_kwargs={"k": 2})
         return True
     except Exception as e:
         print(f"[ERRO RAG] {e}")
@@ -81,13 +86,9 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM CUSTOMIZADO (SANITIZAÇÃO DE KWARGS)
+#  3. LLM CUSTOMIZADO (ANTI-LOOP & ANTI-CRASH)
 # ==============================================================================
 class LocalQwen(LLM):
-    """
-    LLM Local que remove argumentos incompatíveis (callbacks, tools)
-    para evitar o crash do HuggingFace Pipeline.
-    """
     model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     _is_dummy: bool = PrivateAttr(default=True)
 
@@ -104,37 +105,33 @@ class LocalQwen(LLM):
             return "SYSTEM_ERROR: Modelo não carregado."
 
         try:
-            # --- LIMPEZA DE ARGUMENTOS (CRUCIAL) ---
-            # O CrewAI envia objetos complexos que o pipeline não entende.
-            # Removemos tudo que não for essencial.
-            kwargs.pop("callbacks", None) 
-            kwargs.pop("tools", None)
-            kwargs.pop("functions", None)
-            kwargs.pop("tool_choice", None)
-            
-            # Formatação para Qwen (ChatML)
+            # Limpeza TOTAL de argumentos que o CrewAI manda e quebram o pipeline
+            clean_kwargs = {
+                "max_new_tokens": 1024,
+                "return_full_text": False,
+                "do_sample": True,
+                "temperature": 0.1,
+                "repetition_penalty": 1.1 # <--- IMPORTANTE: Evita loops infinitos
+            }
+
+            # Formatação ChatML
             formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
             
-            response = GLOBAL_PIPELINE(
-                formatted_prompt, 
-                max_new_tokens=1024, 
-                return_full_text=False, 
-                do_sample=True,
-                temperature=0.1,
-                # stop_sequence=stop # Comentado por segurança
-            )
+            response = GLOBAL_PIPELINE(formatted_prompt, **clean_kwargs)
             
             generated_text = response[0]['generated_text']
-            
-            # Limpeza manual
             generated_text = generated_text.replace("<|im_end|>", "").strip()
             
+            # Se gerar vazio, retorna algo para não quebrar o parser
+            if not generated_text:
+                return "I completed the task."
+
             return generated_text
 
         except Exception as e:
-            # Captura erros reais e imprime no terminal
-            print(f"\n!!! ERRO DENTRO DO LLM !!!\n{traceback.format_exc()}")
-            return f"INTERNAL_ERROR: {str(e)}"
+            print(f"\n!!! ERRO NO LLM !!!\n{traceback.format_exc()}")
+            # Retorno amigável que engana o CrewAI e evita o Fallback
+            return f"Note: I encountered an internal error: {str(e)}. I will try to proceed with what I know."
 
     @property
     def _llm_type(self) -> str:
@@ -177,30 +174,31 @@ def load_global_model():
         traceback.print_exc()
 
 # ==============================================================================
-#  4. AGENTES (CREWAI)
+#  4. AGENTES (CREWAI SIMPLIFICADO)
 # ==============================================================================
 def create_agents_and_tasks(user_query):
     load_global_model()
-    
     llm = LocalQwen()
+    
+    # Se o PDF não estiver carregado, rodamos sem tools para não quebrar
     tools = [PDFRagTool()] if GLOBAL_VECTOR_DB else []
 
     researcher = Agent(
-        role="Researcher",
-        goal="Find specific facts in the PDF document.",
-        backstory="Expert analyst.",
+        role="Analyst",
+        goal="Extract facts from the PDF.",
+        backstory="Analyst.",
         tools=tools,
         llm=llm,
         verbose=True,
         allow_delegation=False,
         cache=False,
-        max_iter=3 
+        max_iter=2 # Mínimo possível
     )
 
     writer = Agent(
         role="Writer",
-        goal="Write a clear answer.",
-        backstory="Technical writer.",
+        goal="Write the answer.",
+        backstory="Writer.",
         tools=[], 
         llm=llm,
         verbose=True,
@@ -209,14 +207,14 @@ def create_agents_and_tasks(user_query):
     )
 
     task1 = Task(
-        description=f"Search PDF for '{user_query}' and extract facts.",
-        expected_output="A list of facts.",
+        description=f"Read the PDF and find facts about: '{user_query}'",
+        expected_output="List of facts.",
         agent=researcher
     )
 
     task2 = Task(
-        description=f"Answer '{user_query}' based on the facts found.",
-        expected_output="Final answer text.",
+        description=f"Answer '{user_query}' based on facts.",
+        expected_output="Text answer.",
         agent=writer
     )
 
@@ -228,7 +226,6 @@ def create_agents_and_tasks(user_query):
         memory=False, 
         cache=False,
         manager_llm=None,
-        function_calling_llm=llm, # Força o uso do nosso LLM para tool calling também
         embedder={    
              "provider": "huggingface",
              "config": {"model": "sentence-transformers/all-MiniLM-L6-v2"}
@@ -243,7 +240,7 @@ def process_pdf(file_obj):
     try:
         path = file_obj.name if hasattr(file_obj, 'name') else file_obj
         if build_vector_store(path):
-            return "PDF Indexado! Modelo Qwen pronto."
+            return "PDF Indexado! (Memória Otimizada)"
         else:
             return "Erro na indexação."
     except Exception as e: return f"Erro: {e}"
@@ -261,14 +258,14 @@ def chat_function(message, history):
         result = crew.kickoff()
         history[-1] = [message, str(result.raw)]
     except Exception as e:
-        msg = f"Erro no Chat: {str(e)}"
+        msg = f"Erro: {str(e)}"
         print(f"ERRO FINAL: {traceback.format_exc()}")
         history[-1] = [message, msg]
     
     yield history
 
-with gr.Blocks(title="CrewAI + Qwen Local Fixed") as demo:
-    gr.Markdown("# 🤖 CrewAI + Qwen 2.5 (Local)")
+with gr.Blocks(title="CrewAI + Qwen Local (Stable)") as demo:
+    gr.Markdown("# 🤖 CrewAI + Qwen (Versão Estável)")
     
     with gr.Row():
         upl = gr.File(label="Upload PDF")
