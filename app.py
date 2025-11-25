@@ -11,6 +11,8 @@ from langchain_community.llms import HuggingFacePipeline
 from src.agentic_rag.tools.custom_tool import FireCrawlWebSearchTool
 from src.agentic_rag.tools.custom_tool import DocumentSearchTool
 
+os.environ["OPENAI_API_KEY"] = "NA"
+
 # ==============================================================================
 #                           Configuração Global e Cache
 # ==============================================================================
