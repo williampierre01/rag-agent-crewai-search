@@ -5,20 +5,21 @@ from typing import Any, List, Optional
 from crewai import Agent, Crew, Process, Task
 from crewai.tools import BaseTool
 
-# LangChain Imports
+# Imports LangChain e Pydantic
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+from pydantic import PrivateAttr
 
-# Transformers Imports
+# Imports Transformers
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
 
 # ==============================================================================
-#  CONFIGURAÇÃO ANTI-ERRO
+#  CONFIGURAÇÕES DE AMBIENTE
 # ==============================================================================
 os.environ["OPENAI_API_KEY"] = "sk-fake-key-bypass"
 os.environ["OTEL_SDK_DISABLED"] = "true"
@@ -26,9 +27,8 @@ os.environ["OTEL_SDK_DISABLED"] = "true"
 # ==============================================================================
 #  GLOBAL STATE (SINGLETONS)
 # ==============================================================================
-# Armazenamos os objetos pesados AQUI, fora das classes
 GLOBAL_VECTOR_DB = None
-GLOBAL_PIPELINE = None # <--- O modelo fica aqui, seguro.
+GLOBAL_PIPELINE = None 
 
 # ==============================================================================
 #  1. BANCO VETORIAL (RAG)
@@ -68,7 +68,6 @@ class PDFRagTool(BaseTool):
     description: str = "Search the PDF content. Input is the search query."
 
     def _run(self, query: str) -> str:
-        # Acessa a variável global diretamente
         if GLOBAL_VECTOR_DB is None: return "Error: No PDF loaded."
         try:
             docs = GLOBAL_VECTOR_DB.invoke(query)
@@ -76,12 +75,13 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM CUSTOMIZADO (PADRÃO SINGLETON)
+#  3. LLM CUSTOMIZADO (ROBUSTO)
 # ==============================================================================
-# Esta classe agora é "leve". Ela não carrega o modelo, apenas o chama.
-
 class LocalPhi3(LLM):
     model_name: str = "microsoft/Phi-3.5-mini-instruct"
+    
+    # Pydantic: Atributos privados não são serializados
+    _is_ready: bool = PrivateAttr(default=False)
 
     def _call(
         self,
@@ -90,39 +90,49 @@ class LocalPhi3(LLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
-        # Acessa o pipeline GLOBAL. Isso evita erros de serialização do Pydantic/Gradio.
         global GLOBAL_PIPELINE
         
         if GLOBAL_PIPELINE is None:
-            raise ValueError("O Pipeline Global não foi carregado!")
+            return "Erro: O modelo ainda não foi carregado na memória GPU."
 
         try:
-            # Formatação Manual (Chat Template)
+            # LOG: Ver o que o agente está pedindo (ajuda a debugar)
+            # print(f"--- PROMPT ENVIADO AO LLM ---\n{prompt[:100]}...\n---------------------------")
+
+            # Formatação simples para Phi-3
+            # Nota: O prompt do CrewAI já vem com instruções, então concatenamos com cuidado
             formatted_prompt = f"<|user|>\n{prompt}<|end|>\n<|assistant|>"
             
-            # Geração
             response = GLOBAL_PIPELINE(
                 formatted_prompt, 
                 max_new_tokens=1024, 
                 return_full_text=False, 
                 do_sample=True,
-                temperature=0.1
+                temperature=0.1,
+                # stop_sequence=stop # O pipeline HF as vezes falha com stop list, melhor deixar o agente tratar
             )
-            return response[0]['generated_text']
+            
+            generated_text = response[0]['generated_text']
+            
+            # Limpeza básica se o modelo gerar tags de fim
+            generated_text = generated_text.replace("<|end|>", "").strip()
+            
+            return generated_text
+
         except Exception as e:
-            # Imprime o erro REAL no terminal
-            print(f"CRASH NO LLM: {e}")
-            raise e # Lança o erro para o log, mas o CrewAI vai pegar e tentar fallback
+            # CRÍTICO: Capturamos o erro aqui para o CrewAI não tentar o fallback
+            error_msg = f"ERRO INTERNO NO LLM: {str(e)}"
+            print(error_msg)
+            return error_msg
 
     @property
     def _llm_type(self) -> str:
         return "custom_local_phi3"
 
-# Função de Carregamento (Inicializa a variável Global)
+# Função de Carregamento Global
 def load_global_model():
     global GLOBAL_PIPELINE
-    if GLOBAL_PIPELINE is not None: 
-        return
+    if GLOBAL_PIPELINE is not None: return
 
     print("Carregando Modelo na GPU...")
     model_name = "microsoft/Phi-3.5-mini-instruct"
@@ -147,37 +157,37 @@ def load_global_model():
         model=model,
         tokenizer=tokenizer
     )
-    print("Modelo Carregado!")
+    print("Modelo Carregado com Sucesso!")
 
 # ==============================================================================
-#  4. AGENTES (Setup Linear)
+#  4. AGENTES
 # ==============================================================================
 def create_agents_and_tasks(user_query):
-    
-    # Garante que o modelo está carregado globalmente
+    # Garante carregamento
     load_global_model()
     
-    # Instancia nossa classe leve (sem argumentos complexos)
+    # Instancia a classe segura
     llm = LocalPhi3()
     
     tools = [PDFRagTool()] if GLOBAL_VECTOR_DB else []
 
-    # Agente 1: Pesquisa
+    # Agente 1
     researcher = Agent(
         role="Researcher",
-        goal="Find exact quotes in the PDF.",
+        goal="Find facts in the PDF.",
         backstory="Analytical researcher.",
         tools=tools,
         llm=llm,
         verbose=True,
         allow_delegation=False,
-        cache=False
+        cache=False,
+        max_iter=3 # Limita loops infinitos
     )
 
-    # Agente 2: Resposta
+    # Agente 2
     writer = Agent(
         role="Writer",
-        goal="Write a final answer.",
+        goal="Summarize the answer.",
         backstory="Technical writer.",
         tools=[], 
         llm=llm,
@@ -187,14 +197,14 @@ def create_agents_and_tasks(user_query):
     )
 
     task1 = Task(
-        description=f"Search PDF for: '{user_query}'. Return raw facts found.",
-        expected_output="List of facts.",
+        description=f"Search the PDF for: '{user_query}'. Extract relevant quotes.",
+        expected_output="A list of facts from the PDF.",
         agent=researcher
     )
 
     task2 = Task(
-        description=f"Answer '{user_query}' based on the facts.",
-        expected_output="Final text.",
+        description=f"Using the facts provided, write a clear answer for: '{user_query}'",
+        expected_output="Final text answer.",
         agent=writer
     )
 
@@ -218,11 +228,10 @@ def process_pdf(file_obj):
     if not file_obj: return "Sem arquivo."
     try:
         path = file_obj.name if hasattr(file_obj, 'name') else file_obj
-        success = build_vector_store(path)
-        if success:
-            return "PDF Indexado com Sucesso!"
+        if build_vector_store(path):
+            return "PDF Indexado!"
         else:
-            return "Erro ao processar PDF (Verifique Logs)"
+            return "Erro na indexação."
     except Exception as e: return f"Erro: {e}"
 
 @spaces.GPU(duration=120)
@@ -230,7 +239,7 @@ def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    history.append([message, "🤖 Processando (Global Singleton)..."])
+    history.append([message, "🤖 Iniciando Agentes..."])
     yield history
 
     try:
@@ -238,15 +247,12 @@ def chat_function(message, history):
         result = crew.kickoff()
         history[-1] = [message, str(result.raw)]
     except Exception as e:
-        # Mostra o erro real na tela
-        error_msg = f"Erro FATAL no Chat: {str(e)}"
-        print(error_msg)
-        history[-1] = [message, error_msg]
+        history[-1] = [message, f"Erro Fatal: {str(e)}"]
     
     yield history
 
-with gr.Blocks(title="RAG Local Final") as demo:
-    gr.Markdown("# 🛡️ RAG Local (Singleton Fix)")
+with gr.Blocks(title="RAG Final") as demo:
+    gr.Markdown("# 🛡️ RAG Local (Robust Singleton)")
     with gr.Row():
         upl = gr.File(label="PDF")
         st = gr.Markdown("...")
