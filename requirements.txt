@@ -8,4 +8,5 @@ accelerate
 bitsandbytes
 langchain-community
 qdrant-client
+fastembed
 spaces
