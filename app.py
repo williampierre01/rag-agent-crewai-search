@@ -5,13 +5,16 @@ from typing import Any, List, Optional
 from crewai import Agent, Crew, Process, Task
 from crewai.tools import BaseTool
 
-# LangChain Imports
+# LangChain Imports (Atualizados para v0.2+)
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain.llms.base import LLM
-from langchain.callbacks.manager import CallbackManagerForLLMRun
+
+# --- CORREÇÃO DOS IMPORTS DA CLASSE BASE ---
+from langchain_core.language_models.llms import LLM
+from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+# -------------------------------------------
 
 # Transformers Imports
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -20,7 +23,7 @@ import torch
 # ==============================================================================
 #  CONFIGURAÇÃO ANTI-ERRO
 # ==============================================================================
-os.environ["OPENAI_API_KEY"] = "sk-fake-key" # Apenas para calar validações
+os.environ["OPENAI_API_KEY"] = "sk-fake-key" 
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
 # ==============================================================================
@@ -72,11 +75,8 @@ class PDFRagTool(BaseTool):
 # ==============================================================================
 #  3. LLM CUSTOMIZADO (A SOLUÇÃO DEFINITIVA)
 # ==============================================================================
-# Criamos nossa própria classe para ter controle total e evitar fallbacks
-
 class LocalPhi3(LLM):
     model_name: str = "microsoft/Phi-3.5-mini-instruct"
-    # Definimos os campos como Any para evitar validação estrita do Pydantic v1/v2
     pipeline: Any = None 
     tokenizer: Any = None
 
@@ -87,11 +87,9 @@ class LocalPhi3(LLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
-        # Formatação Manual do Chat Prompt (Phi-3 Format)
-        # Isso garante que o modelo entenda quem é quem sem precisar de wrappers complexos
+        # Formatação Manual do Chat Prompt
         formatted_prompt = f"<|user|>\n{prompt}<|end|>\n<|assistant|>"
         
-        # Gera a resposta
         response = self.pipeline(
             formatted_prompt, 
             max_new_tokens=1024, 
@@ -135,7 +133,6 @@ def load_llm():
         tokenizer=tokenizer
     )
 
-    # Instanciamos nossa classe customizada
     global_llm_instance = LocalPhi3(pipeline=text_pipeline, tokenizer=tokenizer)
     
     return global_llm_instance
@@ -226,7 +223,7 @@ def chat_function(message, history):
     yield history
 
 with gr.Blocks(title="RAG Local Final") as demo:
-    gr.Markdown("# 🛡️ RAG Local (Custom Class Fix)")
+    gr.Markdown("# 🛡️ RAG Local (Import Fix)")
     with gr.Row():
         upl = gr.File(label="PDF")
         st = gr.Markdown("...")
