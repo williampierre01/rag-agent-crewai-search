@@ -6,7 +6,11 @@ firecrawl-py
 transformers
 accelerate
 bitsandbytes
+langchain
 langchain-community
-qdrant-client
-fastembed
+langchain_huggingface
+langchain_chroma
+chromadb
+pypdf
 spaces
+gradio
