@@ -23,7 +23,6 @@ import torch
 # ==============================================================================
 #  CONFIGURAÇÕES
 # ==============================================================================
-# Definimos "NA" para garantir que ele não tente validar formato de chave OpenAI
 os.environ["OPENAI_API_KEY"] = "NA"
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
@@ -42,15 +41,13 @@ def build_vector_store(pdf_path):
     print(f"[RAG] Indexando: {pdf_path}")
     
     try:
-        # Limpeza de memória antes de processar
         torch.cuda.empty_cache()
         gc.collect()
 
         loader = PyPDFLoader(pdf_path)
         docs = loader.load()
         
-        # Chunks menores para economizar contexto
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         splits = text_splitter.split_documents(docs)
 
         embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -62,7 +59,6 @@ def build_vector_store(pdf_path):
             persist_directory=None
         )
         
-        # Retorna apenas 3 documentos para não estourar o contexto do LLM
         GLOBAL_VECTOR_DB = vectorstore.as_retriever(search_kwargs={"k": 3})
         return True
     except Exception as e:
@@ -85,12 +81,12 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM CUSTOMIZADO (ANTI-FALLBACK)
+#  3. LLM CUSTOMIZADO (FILTRAGEM DE ARGUMENTOS)
 # ==============================================================================
 class LocalQwen(LLM):
     """
-    Classe LLM que captura QUALQUER erro e retorna como texto,
-    impedindo o CrewAI de acionar o Fallback do LiteLLM.
+    LLM Local que remove argumentos incompatíveis (stop words)
+    para evitar o crash do HuggingFace Pipeline.
     """
     model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     _is_dummy: bool = PrivateAttr(default=True)
@@ -98,48 +94,51 @@ class LocalQwen(LLM):
     def _call(
         self,
         prompt: str,
-        stop: Optional[List[str]] = None,
+        stop: Optional[List[str]] = None, # CrewAI envia isso, mas quebra o pipeline
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
         global GLOBAL_PIPELINE
         
         if GLOBAL_PIPELINE is None:
-            return "SYSTEM_ERROR: Modelo não carregado na GPU."
+            return "SYSTEM_ERROR: Modelo não carregado."
 
         try:
-            # Formatação ChatML para Qwen
+            # Formatação para Qwen (ChatML)
             formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
             
-            # Geração protegida
+            # --- O SEGREDO ESTÁ AQUI ---
+            # Nós IGNORAMOS o argumento 'stop' e 'kwargs' que o CrewAI manda.
+            # O Pipeline do Transformers não lida bem com listas de stop words dinâmicas
+            # em versões antigas ou configurações específicas.
             response = GLOBAL_PIPELINE(
                 formatted_prompt, 
                 max_new_tokens=1024, 
                 return_full_text=False, 
                 do_sample=True,
                 temperature=0.1
-                # Removemos 'stop' e outros kwargs perigosos aqui
+                # Nota: Não passamos 'stop_sequence' aqui propositalmente.
             )
             
             generated_text = response[0]['generated_text']
             
-            # Limpeza
-            return generated_text.replace("<|im_end|>", "").strip()
+            # Limpeza manual
+            generated_text = generated_text.replace("<|im_end|>", "").strip()
+            
+            return generated_text
 
         except Exception as e:
-            # IMPEDE O ERRO FATAL:
-            # Em vez de levantar a exceção (raise), nós retornamos o erro como se fosse a resposta do robô.
-            # Assim você vê o erro no chat e o programa não trava.
-            error_msg = f"INTERNAL_MODEL_ERROR: {str(e)}"
-            print(f"\n!!! ERRO CAPTURADO !!!\n{traceback.format_exc()}")
-            return error_msg
+            # Captura erros de CUDA, Memória ou Tipo
+            print(f"\n!!! ERRO DENTRO DO LLM !!!\n{traceback.format_exc()}")
+            # Retorna o erro como string para não travar o CrewAI
+            return f"INTERNAL_ERROR: {str(e)}"
 
     @property
     def _llm_type(self) -> str:
         return "custom_local_qwen"
 
 # ==============================================================================
-#  CARREGAMENTO GLOBAL (MODELO 7B)
+#  CARREGAMENTO GLOBAL
 # ==============================================================================
 def load_global_model():
     global GLOBAL_PIPELINE
@@ -178,7 +177,6 @@ def load_global_model():
 #  4. AGENTES (CREWAI)
 # ==============================================================================
 def create_agents_and_tasks(user_query):
-    # Carrega o modelo
     load_global_model()
     
     llm = LocalQwen()
@@ -193,7 +191,7 @@ def create_agents_and_tasks(user_query):
         verbose=True,
         allow_delegation=False,
         cache=False,
-        max_iter=3 
+        max_iter=2 # Mantém baixo para evitar loops
     )
 
     writer = Agent(
@@ -225,7 +223,8 @@ def create_agents_and_tasks(user_query):
         process=Process.sequential,
         verbose=True,
         memory=False, 
-        cache=False,  
+        cache=False,
+        manager_llm=None, # Garante que não use Manager
         embedder={    
              "provider": "huggingface",
              "config": {"model": "sentence-transformers/all-MiniLM-L6-v2"}
@@ -258,17 +257,15 @@ def chat_function(message, history):
         result = crew.kickoff()
         history[-1] = [message, str(result.raw)]
     except Exception as e:
-        # Se o erro chegar até aqui, mostramos o Traceback completo
-        full_error = traceback.format_exc()
-        print(f"ERRO FATAL NO GRADIO:\n{full_error}")
-        
-        friendly_error = f"Erro na execução: {str(e)}\n\n(Detalhes no terminal)"
-        history[-1] = [message, friendly_error]
+        msg = f"Erro no Chat: {str(e)}"
+        print(msg)
+        traceback.print_exc()
+        history[-1] = [message, msg]
     
     yield history
 
-with gr.Blocks(title="CrewAI + Qwen Local") as demo:
-    gr.Markdown("# 🤖 CrewAI com Modelo Qwen 2.5 (Local)")
+with gr.Blocks(title="CrewAI + Qwen Local Fixed") as demo:
+    gr.Markdown("# 🤖 CrewAI + Qwen 2.5 (Local)")
     
     with gr.Row():
         upl = gr.File(label="Upload PDF")
