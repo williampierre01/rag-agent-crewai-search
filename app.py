@@ -8,11 +8,11 @@ from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndB
 import torch
 from langchain_community.llms import HuggingFacePipeline
 
-# Certifique-se de que os imports das suas tools customizadas estão corretos
+# Seus imports de ferramentas
 from src.agentic_rag.tools.custom_tool import FireCrawlWebSearchTool
 from src.agentic_rag.tools.custom_tool import DocumentSearchTool
 
-# Variáveis globais para armazenar o modelo carregado (Cache)
+# Variáveis globais para armazenar o modelo carregado (Cache na RAM/VRAM)
 global_model = None
 global_tokenizer = None
 
@@ -21,14 +21,14 @@ global_tokenizer = None
 # ==============================================================================
 def initialize_model():
     """
-    Carrega o modelo apenas quando necessário e se ainda não estiver carregado.
-    Isso evita o erro de 'CUDA initialized in main process'.
+    Carrega o modelo uma única vez. As execuções subsequentes usarão o cache global.
     """
     global global_model, global_tokenizer
     
     if global_model is not None and global_tokenizer is not None:
         return global_model, global_tokenizer
 
+    # Modelo leve e rápido recomendado para testes
     model_name = "microsoft/Phi-3.5-mini-instruct"
     print(f"Iniciando carregamento do modelo: {model_name}...")
 
@@ -38,26 +38,32 @@ def initialize_model():
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        quantization_config=bnb_config,
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            quantization_config=bnb_config,
+        )
 
-    global_tokenizer = tokenizer
-    global_model = model
-    print(f"Modelo {model_name} carregado com sucesso!")
+        global_tokenizer = tokenizer
+        global_model = model
+        print(f"Modelo {model_name} carregado com sucesso!")
+    except Exception as e:
+        print(f"Erro crítico ao carregar modelo: {e}")
+        raise e
+        
     return global_model, global_tokenizer
 
 # ===========================
 #   Configurações LLM
 # ===========================
 def load_llm():
-    # Garante que o modelo está carregado antes de criar o pipeline
+    # Pega do cache global
     model, tokenizer = initialize_model()
 
+    # Pipeline de geração
     text_generation_pipeline = pipeline(
         "text-generation",
         model=model,
@@ -66,6 +72,8 @@ def load_llm():
         do_sample=True,
         temperature=0.7,
         top_p=0.95,
+        # return_full_text=False é importante para evitar repetir o prompt na resposta
+        return_full_text=False 
     )
 
     hf_llm = HuggingFacePipeline(pipeline=text_generation_pipeline)
@@ -75,65 +83,63 @@ def load_llm():
 #   Definição de Agentes e Tarefas
 # ===========================
 
-# ALTERAÇÃO IMPORTANTE: Agora recebe o CAMINHO do PDF (string), não a ferramenta pronta.
-@spaces.GPU(duration=120) 
-def create_agents_and_tasks(pdf_path_str):
-    """Cria a Crew instanciando a ferramenta de PDF aqui dentro (seguro para GPU)."""
+# Esta função roda DENTRO da chat_function, que já tem o decorador @spaces.GPU
+# Portanto, não precisa do decorador aqui se for chamada internamente.
+def create_agents_and_tasks(pdf_path_str, user_query):
+    """
+    Cria a Crew fresca para a execução atual.
+    """
     
     web_search_tool = FireCrawlWebSearchTool()
-
-    # Lista de ferramentas base
     tools_list = [web_search_tool]
 
-    # SE houver um PDF, cria a ferramenta AGORA, dentro do processo da GPU
+    # Instancia a ferramenta de PDF se houver um arquivo
     if pdf_path_str:
-        print(f"Criando ferramenta para o PDF: {pdf_path_str}")
+        print(f"Indexando PDF para consulta: {pdf_path_str}")
         try:
+            # Recria a tool para garantir conexão fresca com a DB vetorial na GPU atual
             pdf_tool = DocumentSearchTool(file_path=pdf_path_str)
             tools_list.append(pdf_tool)
         except Exception as e:
-            print(f"Erro ao criar ferramenta de PDF: {e}")
+            print(f"Aviso: Falha ao criar PDF Tool: {e}")
 
-    # Carregar o LLM
+    # Carrega o LLM (rápido, pois vem do cache global)
     llm_instance = load_llm()
 
+    # --- Agentes ---
     retriever_agent = Agent(
-        role="Retrieve relevant information to answer the user query: {query}",
-        goal=(
-            "Retrieve the most relevant information from the available sources "
-            "for the user query: {query}. Always try to use the PDF search tool first."
-        ),
-        backstory=(
-            "You're a meticulous analyst with a keen eye for detail."
-        ),
+        role="Information Retriever",
+        goal=f"Find relevant information for: {user_query}",
+        backstory="You are an expert researcher.",
         verbose=True,
         tools=tools_list,
         llm=llm_instance
     )
 
-    response_synthesizer_agent = Agent(
-        role="Response synthesizer agent for the user query: {query}",
-        goal="Synthesize the retrieved information into a concise response.",
-        backstory="You're a skilled communicator.",
+    response_agent = Agent(
+        role="Helpful Assistant",
+        goal="Answer the user query based on retrieved info.",
+        backstory="You are a helpful assistant.",
         verbose=True,
         llm=llm_instance
     )
 
-    retrieval_task = Task(
-        description="Retrieve information for: {query}",
-        expected_output="Relevant text retrieved from sources.",
+    # --- Tarefas ---
+    task1 = Task(
+        description=f"Search for information about: {user_query}. Use the PDF tool if available.",
+        expected_output="Key findings related to the query.",
         agent=retriever_agent
     )
 
-    response_task = Task(
-        description="Synthesize final response for: {query}",
-        expected_output="Concise response based on retrieved info.",
-        agent=response_synthesizer_agent
+    task2 = Task(
+        description=f"Synthesize the answer for: {user_query} based on the findings.",
+        expected_output="A clear text answer.",
+        agent=response_agent
     )
 
     crew = Crew(
-        agents=[retriever_agent, response_synthesizer_agent],
-        tasks=[retrieval_task, response_task],
+        agents=[retriever_agent, response_agent],
+        tasks=[task1, task2],
         process=Process.sequential,
         verbose=True
     )
@@ -145,57 +151,49 @@ def create_agents_and_tasks(pdf_path_str):
 
 def process_pdf(file_obj):
     """
-    Processa o arquivo PDF enviado pelo usuário.
-    ALTERAÇÃO: Retorna apenas o CAMINHO do arquivo (string), evitando PicklingError.
+    Apenas pega o caminho do arquivo.
     """
     if not file_obj:
-        return None, "Nenhum arquivo enviado.", None
+        return None, "Nenhum arquivo enviado."
 
     try:
         # Pega o caminho
         file_path = file_obj.name if hasattr(file_obj, 'name') else file_obj
-        
-        # Retorna o CAMINHO, não o objeto
-        return file_path, f"PDF '{os.path.basename(file_path)}' pronto para análise!", None
+        return file_path, f"PDF carregado! Pronto para perguntas."
     except Exception as e:
-        return None, f"Erro ao processar PDF: {str(e)}", None
+        return None, f"Erro no upload: {str(e)}"
 
 @spaces.GPU(duration=120)
-def chat_function(message, history, pdf_path_state, crew_state):
+def chat_function(message, history, pdf_path_state):
     """
-    Função principal do chat.
-    pdf_path_state: Agora é uma string (caminho do arquivo)
+    Função principal. Recria a crew a cada execução para evitar Stale State.
     """
     if not message:
-        return history, crew_state
+        return history
 
-    # Se a Crew não existir, criamos uma nova passando o CAMINHO do PDF
-    if crew_state is None:
-        crew_state = create_agents_and_tasks(pdf_path_state)
+    # 1. Cria a Crew Fresca (passando o caminho do PDF e a query)
+    try:
+        crew = create_agents_and_tasks(pdf_path_state, message)
+    except Exception as e:
+        history.append((message, f"Erro ao criar agentes: {str(e)}"))
+        return history
 
+    # 2. Executa
     inputs = {"query": message}
+    
+    # Placeholder no chat
+    history.append((message, "Thinking..."))
+    yield history
 
     try:
-        result_obj = crew_state.kickoff(inputs=inputs)
+        result_obj = crew.kickoff(inputs=inputs)
         final_response = result_obj.raw
     except Exception as e:
-        final_response = f"Ocorreu um erro ao processar: {str(e)}"
+        final_response = f"Erro na execução da Crew: {str(e)}"
 
-    # Simulação de streaming
-    history.append((message, ""))
-    
-    # Exibir resposta gradualmente
-    full_text = ""
-    for char in final_response:
-        full_text += char
-        history[-1] = (message, full_text)
-        if len(full_text) % 5 == 0:
-            yield history, crew_state
-            time.sleep(0.001)
-            
-    # Garantir atualização final
+    # 3. Atualiza o chat com a resposta final
     history[-1] = (message, final_response)
-    yield history, crew_state
+    yield history
 
 
 # ===========================
@@ -204,15 +202,13 @@ def chat_function(message, history, pdf_path_state, crew_state):
 
 with gr.Blocks(title="Agentic RAG com CrewAI") as demo:
 
-    # Estados
-    pdf_path_state = gr.State(None) # Armazena String (caminho)
-    crew_state = gr.State(None)     # Armazena Objeto Crew
+    # Apenas o caminho do PDF é estado persistente. A Crew é efêmera.
+    pdf_path_state = gr.State(None)
 
     gr.Markdown("# Agentic RAG powered by CrewAI")
 
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### Adicione seu Documento PDF")
             file_upload = gr.File(label="Upload PDF", file_types=[".pdf"])
             upload_status = gr.Markdown("Aguardando upload...")
             clear_btn = gr.Button("Limpar Chat")
@@ -225,25 +221,24 @@ with gr.Blocks(title="Agentic RAG com CrewAI") as demo:
     file_upload.change(
         fn=process_pdf,
         inputs=[file_upload],
-        outputs=[pdf_path_state, upload_status, crew_state] # Atualiza o caminho e reseta a crew
+        outputs=[pdf_path_state, upload_status]
     )
 
-    # Evento de Enviar Mensagem
+    # Evento de Chat
     msg_input.submit(
         fn=chat_function,
-        inputs=[msg_input, chatbot, pdf_path_state, crew_state],
-        outputs=[chatbot, crew_state]
+        inputs=[msg_input, chatbot, pdf_path_state], # Removemos crew_state daqui
+        outputs=[chatbot]                            # Removemos crew_state daqui
     ).then(
         fn=lambda: "", outputs=[msg_input]
     )
 
     def reset_history():
-        return [], None
+        return []
 
     clear_btn.click(
         fn=reset_history,
-        inputs=None,
-        outputs=[chatbot, crew_state]
+        outputs=[chatbot]
     )
 
 if __name__ == "__main__":
