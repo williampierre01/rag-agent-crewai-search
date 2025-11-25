@@ -5,16 +5,14 @@ from typing import Any, List, Optional
 from crewai import Agent, Crew, Process, Task
 from crewai.tools import BaseTool
 
-# LangChain Imports (Atualizados para v0.2+)
+# LangChain & Pydantic Imports
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-
-# --- CORREÇÃO DOS IMPORTS DA CLASSE BASE ---
 from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
-# -------------------------------------------
+from pydantic import PrivateAttr # <--- IMPORTANTE: Correção do erro de validação
 
 # Transformers Imports
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -23,7 +21,7 @@ import torch
 # ==============================================================================
 #  CONFIGURAÇÃO ANTI-ERRO
 # ==============================================================================
-os.environ["OPENAI_API_KEY"] = "sk-fake-key" 
+os.environ["OPENAI_API_KEY"] = "sk-fake-key-bypass"
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
 # ==============================================================================
@@ -39,23 +37,27 @@ def build_vector_store(pdf_path):
     global VECTOR_DB_RETRIEVER
     print(f"[RAG] Indexando: {pdf_path}")
     
-    loader = PyPDFLoader(pdf_path)
-    docs = loader.load()
-    
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    splits = text_splitter.split_documents(docs)
+    try:
+        loader = PyPDFLoader(pdf_path)
+        docs = loader.load()
+        
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        splits = text_splitter.split_documents(docs)
 
-    embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-    vectorstore = Chroma.from_documents(
-        documents=splits,
-        embedding=embedding_model,
-        collection_name="pdf_rag_store",
-        persist_directory=None
-    )
-    
-    VECTOR_DB_RETRIEVER = vectorstore.as_retriever(search_kwargs={"k": 4})
-    return True
+        vectorstore = Chroma.from_documents(
+            documents=splits,
+            embedding=embedding_model,
+            collection_name="pdf_rag_store",
+            persist_directory=None
+        )
+        
+        VECTOR_DB_RETRIEVER = vectorstore.as_retriever(search_kwargs={"k": 4})
+        return True
+    except Exception as e:
+        print(f"[ERRO RAG] {e}")
+        return False
 
 # ==============================================================================
 #  2. FERRAMENTA CUSTOMIZADA
@@ -73,12 +75,19 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM CUSTOMIZADO (A SOLUÇÃO DEFINITIVA)
+#  3. LLM CUSTOMIZADO (CORRIGIDO COM PrivateAttr)
 # ==============================================================================
 class LocalPhi3(LLM):
     model_name: str = "microsoft/Phi-3.5-mini-instruct"
-    pipeline: Any = None 
-    tokenizer: Any = None
+    
+    # Declaramos como atributos privados para o Pydantic não tentar validar/serializar
+    _pipeline: Any = PrivateAttr()
+    _tokenizer: Any = PrivateAttr()
+
+    def __init__(self, pipeline, tokenizer, **kwargs):
+        super().__init__(**kwargs)
+        self._pipeline = pipeline
+        self._tokenizer = tokenizer
 
     def _call(
         self,
@@ -87,17 +96,23 @@ class LocalPhi3(LLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
-        # Formatação Manual do Chat Prompt
-        formatted_prompt = f"<|user|>\n{prompt}<|end|>\n<|assistant|>"
-        
-        response = self.pipeline(
-            formatted_prompt, 
-            max_new_tokens=1024, 
-            return_full_text=False, 
-            do_sample=True,
-            temperature=0.1
-        )
-        return response[0]['generated_text']
+        try:
+            # Formatação Manual (Chat Template simplificado)
+            # Phi-3 espera <|user|> ... <|end|>
+            formatted_prompt = f"<|user|>\n{prompt}<|end|>\n<|assistant|>"
+            
+            response = self._pipeline(
+                formatted_prompt, 
+                max_new_tokens=1024, 
+                return_full_text=False, 
+                do_sample=True,
+                temperature=0.1
+            )
+            return response[0]['generated_text']
+        except Exception as e:
+            # Se der erro aqui, imprimimos para ver no log em vez de deixar o CrewAI tentar LiteLLM
+            print(f"[ERRO LLM] Falha na geração: {e}")
+            return f"Error generating response: {str(e)}"
 
     @property
     def _llm_type(self) -> str:
@@ -133,6 +148,7 @@ def load_llm():
         tokenizer=tokenizer
     )
 
+    # Instanciamos passando os objetos complexos
     global_llm_instance = LocalPhi3(pipeline=text_pipeline, tokenizer=tokenizer)
     
     return global_llm_instance
@@ -148,7 +164,7 @@ def create_agents_and_tasks(user_query):
     # Agente 1: Pesquisa
     researcher = Agent(
         role="Researcher",
-        goal="Find exact quotes in the PDF.",
+        goal="Find facts in the PDF.",
         backstory="Analytical researcher.",
         tools=tools,
         llm=llm,
@@ -170,7 +186,7 @@ def create_agents_and_tasks(user_query):
     )
 
     task1 = Task(
-        description=f"Search PDF for: '{user_query}'. Return raw facts.",
+        description=f"Search PDF for: '{user_query}'. Return raw facts found.",
         expected_output="List of facts.",
         agent=researcher
     )
@@ -201,8 +217,11 @@ def process_pdf(file_obj):
     if not file_obj: return "Sem arquivo."
     try:
         path = file_obj.name if hasattr(file_obj, 'name') else file_obj
-        build_vector_store(path)
-        return "PDF Pronto!"
+        success = build_vector_store(path)
+        if success:
+            return "PDF Indexado com Sucesso!"
+        else:
+            return "Erro ao processar PDF (Verifique Logs)"
     except Exception as e: return f"Erro: {e}"
 
 @spaces.GPU(duration=120)
@@ -210,7 +229,7 @@ def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    history.append([message, "🤖 Processando (Local Customizado)..."])
+    history.append([message, "🤖 Processando (Local)..."])
     yield history
 
     try:
@@ -218,12 +237,14 @@ def chat_function(message, history):
         result = crew.kickoff()
         history[-1] = [message, str(result.raw)]
     except Exception as e:
-        history[-1] = [message, f"Erro: {str(e)}"]
+        error_msg = f"Erro no Chat: {str(e)}"
+        print(error_msg)
+        history[-1] = [message, error_msg]
     
     yield history
 
 with gr.Blocks(title="RAG Local Final") as demo:
-    gr.Markdown("# 🛡️ RAG Local (Import Fix)")
+    gr.Markdown("# 🛡️ RAG Local (Pydantic Fix)")
     with gr.Row():
         upl = gr.File(label="PDF")
         st = gr.Markdown("...")
