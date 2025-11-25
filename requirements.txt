@@ -16,3 +16,4 @@ qdrant_client
 jinja2
 spaces
 gradio
+pydantic
