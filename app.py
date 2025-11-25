@@ -10,18 +10,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
-# LLM Imports (Novos)
+# LLM Imports
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
-from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline # <--- MUDANÇA IMPORTANTE
+from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
 
 # ==============================================================================
-#  CONFIGURAÇÃO DE "SPOOFING" (Enganar o sistema)
+#  CONFIGURAÇÃO "SPOOFING" (Anti-OpenAI)
 # ==============================================================================
-# 1. Formato de chave que parece real (começa com sk-)
 os.environ["OPENAI_API_KEY"] = "sk-proj-fake-key-to-bypass-validation"
-# 2. Redirecionar chamadas da OpenAI para o vazio (Localhost)
-# Isso garante que NUNCA chegue nos servidores da OpenAI para dar erro 401.
 os.environ["OPENAI_API_BASE"] = "http://127.0.0.1:11434/v1" 
 os.environ["OPENAI_MODEL_NAME"] = "microsoft/Phi-3.5-mini-instruct"
 os.environ["OTEL_SDK_DISABLED"] = "true"
@@ -73,7 +70,7 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM (Wrapper de Chat) - A SOLUÇÃO
+#  3. LLM (CORREÇÃO AQUI)
 # ==============================================================================
 global_llm = None
 
@@ -89,12 +86,13 @@ def load_llm():
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
         quantization_config=bnb_config,
+        trust_remote_code=True
     )
 
     # 1. Pipeline Base
@@ -106,16 +104,14 @@ def load_llm():
         do_sample=True,
         temperature=0.1,
         return_full_text=False,
-        # Importante para Phi-3.5 entender que é um chat
-        trust_remote_code=True 
     )
 
     # 2. Converte Pipeline em LangChain LLM
     hf_pipeline = HuggingFacePipeline(pipeline=text_generation_pipeline)
 
-    # 3. MÁGICA: Converte em "ChatModel" (Isso evita o fallback para OpenAI)
-    # O CrewAI adora modelos de Chat. Ao dar um ChatModel local, ele para de reclamar.
-    global_llm = ChatHuggingFace(llm=hf_pipeline)
+    # 3. MÁGICA: Passamos o model_id explicitamente!
+    # Isso permite que ele ache o template correto e não tente o fallback.
+    global_llm = ChatHuggingFace(llm=hf_pipeline, model_id=model_name)
     
     return global_llm
 
@@ -136,7 +132,7 @@ def create_agents_and_tasks(user_query):
         llm=llm,
         verbose=True,
         allow_delegation=False,
-        cache=False # Importante
+        cache=False
     )
 
     # Agente 2: Resposta
@@ -148,7 +144,7 @@ def create_agents_and_tasks(user_query):
         llm=llm,
         verbose=True,
         allow_delegation=False,
-        cache=False # Importante
+        cache=False
     )
 
     task1 = Task(
@@ -168,9 +164,9 @@ def create_agents_and_tasks(user_query):
         tasks=[task1, task2],
         process=Process.sequential,
         verbose=True,
-        memory=False, # Importante
-        cache=False,  # Importante
-        embedder={    # Força Embeddings Locais na config da Crew
+        memory=False, 
+        cache=False,  
+        embedder={    
              "provider": "huggingface",
              "config": {"model": "sentence-transformers/all-MiniLM-L6-v2"}
         }
