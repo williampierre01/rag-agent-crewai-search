@@ -12,5 +12,6 @@ langchain_huggingface
 langchain_chroma
 chromadb
 pypdf
+qdrant_client
 spaces
 gradio
