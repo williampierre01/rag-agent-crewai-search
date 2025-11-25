@@ -1,36 +1,35 @@
 import gradio as gr
 import os
 import time
-import gc
 import spaces
 from crewai import Agent, Crew, Process, Task
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
 from langchain_community.llms import HuggingFacePipeline
 
-# Seus imports de ferramentas
+# Seus imports de ferramentas (certifique-se que o caminho src está correto)
 from src.agentic_rag.tools.custom_tool import FireCrawlWebSearchTool
 from src.agentic_rag.tools.custom_tool import DocumentSearchTool
 
-# Variáveis globais para armazenar o modelo carregado (Cache na RAM/VRAM)
+# ==============================================================================
+#                           Configuração Global e Cache
+# ==============================================================================
+# Variáveis para armazenar o modelo na RAM/VRAM e não carregar toda vez
 global_model = None
 global_tokenizer = None
 
-# ==============================================================================
-#                           Carregamento do Modelo (Lazy Loading)
-# ==============================================================================
 def initialize_model():
     """
-    Carrega o modelo uma única vez. As execuções subsequentes usarão o cache global.
+    Carrega o modelo apenas se ainda não estiver na memória global.
     """
     global global_model, global_tokenizer
     
     if global_model is not None and global_tokenizer is not None:
         return global_model, global_tokenizer
 
-    # Modelo leve e rápido recomendado para testes
+    # Modelo eficiente para rodar no ZeroGPU
     model_name = "microsoft/Phi-3.5-mini-instruct"
-    print(f"Iniciando carregamento do modelo: {model_name}...")
+    print(f"[SYSTEM] Iniciando carregamento do modelo: {model_name}...")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -49,21 +48,17 @@ def initialize_model():
 
         global_tokenizer = tokenizer
         global_model = model
-        print(f"Modelo {model_name} carregado com sucesso!")
+        print(f"[SYSTEM] Modelo {model_name} carregado com sucesso!")
     except Exception as e:
-        print(f"Erro crítico ao carregar modelo: {e}")
+        print(f"[ERRO] Falha crítica ao carregar modelo: {e}")
         raise e
         
     return global_model, global_tokenizer
 
-# ===========================
-#   Configurações LLM
-# ===========================
 def load_llm():
-    # Pega do cache global
+    """Cria o pipeline do LangChain/HuggingFace."""
     model, tokenizer = initialize_model()
 
-    # Pipeline de geração
     text_generation_pipeline = pipeline(
         "text-generation",
         model=model,
@@ -72,68 +67,66 @@ def load_llm():
         do_sample=True,
         temperature=0.7,
         top_p=0.95,
-        # return_full_text=False é importante para evitar repetir o prompt na resposta
-        return_full_text=False 
+        return_full_text=False # Importante para não repetir a pergunta
     )
 
     hf_llm = HuggingFacePipeline(pipeline=text_generation_pipeline)
     return hf_llm
 
-# ===========================
-#   Definição de Agentes e Tarefas
-# ===========================
+# ==============================================================================
+#                           Lógica do CrewAI
+# ==============================================================================
 
-# Esta função roda DENTRO da chat_function, que já tem o decorador @spaces.GPU
-# Portanto, não precisa do decorador aqui se for chamada internamente.
 def create_agents_and_tasks(pdf_path_str, user_query):
     """
-    Cria a Crew fresca para a execução atual.
+    Cria os agentes, tarefas e ferramentas para a execução atual.
     """
+    print(f"[CREW] Montando equipe para query: {user_query}")
     
+    # 1. Ferramentas
     web_search_tool = FireCrawlWebSearchTool()
     tools_list = [web_search_tool]
 
-    # Instancia a ferramenta de PDF se houver um arquivo
     if pdf_path_str:
-        print(f"Indexando PDF para consulta: {pdf_path_str}")
+        print(f"[CREW] Adicionando ferramenta de PDF: {pdf_path_str}")
         try:
-            # Recria a tool para garantir conexão fresca com a DB vetorial na GPU atual
+            # Recria a ferramenta para garantir conexão válida na GPU atual
             pdf_tool = DocumentSearchTool(file_path=pdf_path_str)
             tools_list.append(pdf_tool)
         except Exception as e:
-            print(f"Aviso: Falha ao criar PDF Tool: {e}")
+            print(f"[AVISO] Erro ao criar PDF Tool (seguindo sem ela): {e}")
 
-    # Carrega o LLM (rápido, pois vem do cache global)
+    # 2. LLM
     llm_instance = load_llm()
 
-    # --- Agentes ---
+    # 3. Agentes
     retriever_agent = Agent(
-        role="Information Retriever",
-        goal=f"Find relevant information for: {user_query}",
-        backstory="You are an expert researcher.",
+        role="Senior Researcher",
+        goal=f"Find specific information to answer: {user_query}",
+        backstory="You are an expert at finding information in PDFs and the Web.",
         verbose=True,
         tools=tools_list,
         llm=llm_instance
     )
 
     response_agent = Agent(
-        role="Helpful Assistant",
-        goal="Answer the user query based on retrieved info.",
-        backstory="You are a helpful assistant.",
+        role="Customer Support Lead",
+        goal="Synthesize the found information into a clear answer.",
+        backstory="You provide concise and helpful answers based on research.",
         verbose=True,
         llm=llm_instance
     )
 
-    # --- Tarefas ---
+    # 4. Tarefas
     task1 = Task(
-        description=f"Search for information about: {user_query}. Use the PDF tool if available.",
-        expected_output="Key findings related to the query.",
+        description=f"Search for '{user_query}'. Use the PDF tool first if available.",
+        expected_output="Key findings regarding the query.",
         agent=retriever_agent
     )
 
     task2 = Task(
-        description=f"Synthesize the answer for: {user_query} based on the findings.",
-        expected_output="A clear text answer.",
+        description=f"Write a final answer for '{user_query}' based on the findings.",
+        expected_output="A helpful text response.",
         agent=response_agent
     )
 
@@ -145,101 +138,88 @@ def create_agents_and_tasks(pdf_path_str, user_query):
     )
     return crew
 
-# ===========================
-#   Funções de Lógica do Gradio
-# ===========================
+# ==============================================================================
+#                           Funções do Gradio
+# ==============================================================================
 
 def process_pdf(file_obj):
-    """
-    Apenas pega o caminho do arquivo.
-    """
+    """Salva apenas o caminho do arquivo para evitar erros de serialização."""
     if not file_obj:
-        return None, "Nenhum arquivo enviado."
+        return None, "Nenhum arquivo recebido."
 
     try:
-        # Pega o caminho
         file_path = file_obj.name if hasattr(file_obj, 'name') else file_obj
-        return file_path, f"PDF carregado! Pronto para perguntas."
+        return file_path, f"PDF carregado: {os.path.basename(file_path)}"
     except Exception as e:
         return None, f"Erro no upload: {str(e)}"
 
 @spaces.GPU(duration=120)
 def chat_function(message, history, pdf_path_state):
     """
-    Função principal. Recria a crew a cada execução para evitar Stale State.
+    Função principal com tratamento de erros e feedback visual.
     """
+    print(f"\n--- NOVA INTERAÇÃO: {message} ---")
+    
     if not message:
         return history
 
-    # 1. Cria a Crew Fresca (passando o caminho do PDF e a query)
-    try:
-        crew = create_agents_and_tasks(pdf_path_state, message)
-    except Exception as e:
-        history.append((message, f"Erro ao criar agentes: {str(e)}"))
-        return history
+    if history is None:
+        history = []
 
-    # 2. Executa
-    inputs = {"query": message}
-    
-    # Placeholder no chat
-    history.append((message, "Thinking..."))
+    # 1. Feedback Imediato (Usuario vê que algo está rodando)
+    history.append([message, "🔍 Processando... Por favor, aguarde."])
     yield history
 
     try:
+        # 2. Criação da Crew
+        print("[STEP 1] Criando Agentes...")
+        crew = create_agents_and_tasks(pdf_path_state, message)
+        
+        # 3. Execução
+        print("[STEP 2] Iniciando Kickoff...")
+        inputs = {"query": message}
         result_obj = crew.kickoff(inputs=inputs)
         final_response = result_obj.raw
+        
+        print("[STEP 3] Sucesso!")
+
+        # 4. Atualiza resposta final
+        history[-1] = [message, final_response]
+        yield history
+
     except Exception as e:
-        final_response = f"Erro na execução da Crew: {str(e)}"
+        # Se der erro, mostra no chat para você saber o que foi
+        error_msg = f"❌ Ocorreu um erro: {str(e)}"
+        print(f"[ERRO FATAL] {error_msg}")
+        history[-1] = [message, error_msg]
+        yield history
 
-    # 3. Atualiza o chat com a resposta final
-    history[-1] = (message, final_response)
-    yield history
-
-
-# ===========================
-#   Interface Gradio
-# ===========================
+# ==============================================================================
+#                           Interface UI
+# ==============================================================================
 
 with gr.Blocks(title="Agentic RAG com CrewAI") as demo:
 
-    # Apenas o caminho do PDF é estado persistente. A Crew é efêmera.
+    # Estado apenas para o caminho (String)
     pdf_path_state = gr.State(None)
 
-    gr.Markdown("# Agentic RAG powered by CrewAI")
+    gr.Markdown("# 🤖 Agentic RAG powered by CrewAI")
+    gr.Markdown("Faça upload de um PDF e faça perguntas. O sistema usará Agentes para pesquisar no PDF e na Web.")
 
     with gr.Row():
         with gr.Column(scale=1):
             file_upload = gr.File(label="Upload PDF", file_types=[".pdf"])
-            upload_status = gr.Markdown("Aguardando upload...")
-            clear_btn = gr.Button("Limpar Chat")
+            upload_status = gr.Markdown("Status: Aguardando arquivo...")
+            clear_btn = gr.Button("🗑️ Limpar Conversa")
 
         with gr.Column(scale=4):
-            chatbot = gr.Chatbot(label="Histórico", height=600)
-            msg_input = gr.Textbox(label="Pergunta", placeholder="Digite aqui...")
+            chatbot = gr.Chatbot(label="Chat", height=600, type="messages")
+            # Nota: type="messages" é o novo padrão, mas se der erro visual, remova esse parametro.
+            
+            msg_input = gr.Textbox(label="Sua Pergunta", placeholder="Digite aqui e pressione Enter...")
 
-    # Evento de Upload
+    # Eventos
     file_upload.change(
         fn=process_pdf,
         inputs=[file_upload],
-        outputs=[pdf_path_state, upload_status]
-    )
-
-    # Evento de Chat
-    msg_input.submit(
-        fn=chat_function,
-        inputs=[msg_input, chatbot, pdf_path_state], # Removemos crew_state daqui
-        outputs=[chatbot]                            # Removemos crew_state daqui
-    ).then(
-        fn=lambda: "", outputs=[msg_input]
-    )
-
-    def reset_history():
-        return []
-
-    clear_btn.click(
-        fn=reset_history,
-        outputs=[chatbot]
-    )
-
-if __name__ == "__main__":
-    demo.launch()
+        outputs=[pdf
