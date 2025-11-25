@@ -2,11 +2,12 @@ import gradio as gr
 import os
 import spaces
 import traceback
+import gc
 from typing import Any, List, Optional
 from crewai import Agent, Crew, Process, Task
 from crewai.tools import BaseTool
 
-# LangChain & Pydantic
+# LangChain Imports
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -15,14 +16,15 @@ from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
 from pydantic import PrivateAttr
 
-# Transformers
+# Transformers Imports
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
 
 # ==============================================================================
 #  CONFIGURAÇÕES
 # ==============================================================================
-os.environ["OPENAI_API_KEY"] = "sk-fake-key-bypass"
+# Definimos "NA" para garantir que ele não tente validar formato de chave OpenAI
+os.environ["OPENAI_API_KEY"] = "NA"
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
 # ==============================================================================
@@ -40,10 +42,15 @@ def build_vector_store(pdf_path):
     print(f"[RAG] Indexando: {pdf_path}")
     
     try:
+        # Limpeza de memória antes de processar
+        torch.cuda.empty_cache()
+        gc.collect()
+
         loader = PyPDFLoader(pdf_path)
         docs = loader.load()
         
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        # Chunks menores para economizar contexto
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
         splits = text_splitter.split_documents(docs)
 
         embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -55,7 +62,8 @@ def build_vector_store(pdf_path):
             persist_directory=None
         )
         
-        GLOBAL_VECTOR_DB = vectorstore.as_retriever(search_kwargs={"k": 4})
+        # Retorna apenas 3 documentos para não estourar o contexto do LLM
+        GLOBAL_VECTOR_DB = vectorstore.as_retriever(search_kwargs={"k": 3})
         return True
     except Exception as e:
         print(f"[ERRO RAG] {e}")
@@ -77,12 +85,12 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM CUSTOMIZADO (QWEN 2.5 - BLINDADO)
+#  3. LLM CUSTOMIZADO (ANTI-FALLBACK)
 # ==============================================================================
 class LocalQwen(LLM):
     """
-    Classe customizada para rodar o Qwen 2.5 localmente com CrewAI.
-    Usa PrivateAttr para evitar erros de validação do Pydantic.
+    Classe LLM que captura QUALQUER erro e retorna como texto,
+    impedindo o CrewAI de acionar o Fallback do LiteLLM.
     """
     model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     _is_dummy: bool = PrivateAttr(default=True)
@@ -97,34 +105,34 @@ class LocalQwen(LLM):
         global GLOBAL_PIPELINE
         
         if GLOBAL_PIPELINE is None:
-            return "Erro: O modelo ainda não foi carregado na memória GPU."
+            return "SYSTEM_ERROR: Modelo não carregado na GPU."
 
         try:
-            # Formatação para Qwen (ChatML)
-            # O CrewAI manda um prompt gigante com instruções. 
-            # Envolvemos tudo em tags de usuário para o Qwen processar.
+            # Formatação ChatML para Qwen
             formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
             
-            # Geração
+            # Geração protegida
             response = GLOBAL_PIPELINE(
                 formatted_prompt, 
                 max_new_tokens=1024, 
                 return_full_text=False, 
                 do_sample=True,
-                temperature=0.1 # Baixa temperatura para seguir regras do CrewAI
+                temperature=0.1
+                # Removemos 'stop' e outros kwargs perigosos aqui
             )
             
             generated_text = response[0]['generated_text']
             
-            # Limpeza de tags do Qwen
-            generated_text = generated_text.replace("<|im_end|>", "").strip()
-            
-            return generated_text
+            # Limpeza
+            return generated_text.replace("<|im_end|>", "").strip()
 
         except Exception as e:
-            print("\n=== ERRO NO MODELO LOCAL ===")
-            traceback.print_exc() 
-            return f"SYSTEM_ERROR: {str(e)}"
+            # IMPEDE O ERRO FATAL:
+            # Em vez de levantar a exceção (raise), nós retornamos o erro como se fosse a resposta do robô.
+            # Assim você vê o erro no chat e o programa não trava.
+            error_msg = f"INTERNAL_MODEL_ERROR: {str(e)}"
+            print(f"\n!!! ERRO CAPTURADO !!!\n{traceback.format_exc()}")
+            return error_msg
 
     @property
     def _llm_type(self) -> str:
@@ -137,9 +145,8 @@ def load_global_model():
     global GLOBAL_PIPELINE
     if GLOBAL_PIPELINE is not None: return
 
-    print("--- INICIANDO CARREGAMENTO DO QWEN 2.5 (7B) ---")
+    print("--- INICIANDO CARREGAMENTO DO QWEN ---")
     try:
-        # Modelo muito mais inteligente que o Phi-3
         model_name = "Qwen/Qwen2.5-7B-Instruct"
         
         bnb_config = BitsAndBytesConfig(
@@ -174,15 +181,13 @@ def create_agents_and_tasks(user_query):
     # Carrega o modelo
     load_global_model()
     
-    # Instancia nossa classe segura
     llm = LocalQwen()
-    
     tools = [PDFRagTool()] if GLOBAL_VECTOR_DB else []
 
     researcher = Agent(
         role="Researcher",
         goal="Find specific facts in the PDF document.",
-        backstory="You are an expert analyst. You read the PDF using the tool and extract exact information.",
+        backstory="Expert analyst.",
         tools=tools,
         llm=llm,
         verbose=True,
@@ -193,8 +198,8 @@ def create_agents_and_tasks(user_query):
 
     writer = Agent(
         role="Writer",
-        goal="Write a clear answer based on the facts found.",
-        backstory="You are a technical writer. You summarize the information found by the Researcher.",
+        goal="Write a clear answer.",
+        backstory="Technical writer.",
         tools=[], 
         llm=llm,
         verbose=True,
@@ -203,14 +208,14 @@ def create_agents_and_tasks(user_query):
     )
 
     task1 = Task(
-        description=f"Use the SearchPDF tool to find information about: '{user_query}'. Extract the key facts.",
-        expected_output="A list of facts found in the document.",
+        description=f"Search PDF for '{user_query}' and extract facts.",
+        expected_output="A list of facts.",
         agent=researcher
     )
 
     task2 = Task(
-        description=f"Using the facts provided, write a final answer to the question: '{user_query}'",
-        expected_output="A concise text answer.",
+        description=f"Answer '{user_query}' based on the facts found.",
+        expected_output="Final answer text.",
         agent=writer
     )
 
@@ -245,7 +250,7 @@ def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    history.append([message, "🤖 Agentes trabalhando (Qwen 7B)..."])
+    history.append([message, "🤖 Agentes Trabalhando..."])
     yield history
 
     try:
@@ -253,18 +258,20 @@ def chat_function(message, history):
         result = crew.kickoff()
         history[-1] = [message, str(result.raw)]
     except Exception as e:
-        msg = f"Erro no Chat: {str(e)}"
-        print(msg)
-        traceback.print_exc()
-        history[-1] = [message, msg]
+        # Se o erro chegar até aqui, mostramos o Traceback completo
+        full_error = traceback.format_exc()
+        print(f"ERRO FATAL NO GRADIO:\n{full_error}")
+        
+        friendly_error = f"Erro na execução: {str(e)}\n\n(Detalhes no terminal)"
+        history[-1] = [message, friendly_error]
     
     yield history
 
 with gr.Blocks(title="CrewAI + Qwen Local") as demo:
     gr.Markdown("# 🤖 CrewAI com Modelo Qwen 2.5 (Local)")
-    gr.Markdown("Usando Qwen-7B para maior estabilidade com Agentes.")
+    
     with gr.Row():
-        upl = gr.File(label="PDF")
+        upl = gr.File(label="Upload PDF")
         st = gr.Markdown("...")
     chat = gr.Chatbot(height=550)
     msg = gr.Textbox(label="Pergunta")
