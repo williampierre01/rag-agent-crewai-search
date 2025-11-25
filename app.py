@@ -4,21 +4,26 @@ import spaces
 from crewai import Agent, Crew, Process, Task
 from crewai.tools import BaseTool
 
-# RAG / Vector DB Imports
+# RAG Imports
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
-# LLM Imports
+# LLM Imports (Novos)
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
-from langchain_community.llms import HuggingFacePipeline
+from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline # <--- MUDANÇA IMPORTANTE
 
 # ==============================================================================
-#  CONFIGURAÇÕES DE SEGURANÇA (Anti-OpenAI)
+#  CONFIGURAÇÃO DE "SPOOFING" (Enganar o sistema)
 # ==============================================================================
-os.environ["OPENAI_API_KEY"] = "NA"
+# 1. Formato de chave que parece real (começa com sk-)
+os.environ["OPENAI_API_KEY"] = "sk-proj-fake-key-to-bypass-validation"
+# 2. Redirecionar chamadas da OpenAI para o vazio (Localhost)
+# Isso garante que NUNCA chegue nos servidores da OpenAI para dar erro 401.
+os.environ["OPENAI_API_BASE"] = "http://127.0.0.1:11434/v1" 
+os.environ["OPENAI_MODEL_NAME"] = "microsoft/Phi-3.5-mini-instruct"
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
 # ==============================================================================
@@ -27,63 +32,54 @@ os.environ["OTEL_SDK_DISABLED"] = "true"
 VECTOR_DB_RETRIEVER = None
 
 # ==============================================================================
-#  1. PREPARAÇÃO DO BANCO VETORIAL (RAG)
+#  1. BANCO VETORIAL (RAG)
 # ==============================================================================
 @spaces.GPU
 def build_vector_store(pdf_path):
     global VECTOR_DB_RETRIEVER
-    print(f"[RAG] Processando PDF: {pdf_path}")
+    print(f"[RAG] Indexando: {pdf_path}")
     
-    # Carrega e divide o PDF
     loader = PyPDFLoader(pdf_path)
     docs = loader.load()
     
-    # Chunk size ajustado para o Phi-3.5 (não perder contexto)
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     splits = text_splitter.split_documents(docs)
 
-    # Embeddings Locais
     embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-    # Cria Banco Vetorial na Memória
     vectorstore = Chroma.from_documents(
         documents=splits,
         embedding=embedding_model,
-        collection_name="pdf_knowledge_base",
+        collection_name="pdf_rag_store",
         persist_directory=None
     )
     
     VECTOR_DB_RETRIEVER = vectorstore.as_retriever(search_kwargs={"k": 4})
-    print("[RAG] Banco pronto.")
     return True
 
 # ==============================================================================
-#  2. FERRAMENTA DE BUSCA NO PDF
+#  2. FERRAMENTA CUSTOMIZADA
 # ==============================================================================
 class PDFRagTool(BaseTool):
     name: str = "SearchPDF"
-    description: str = "Search for information inside the PDF. Input: The query string."
+    description: str = "Search the PDF content. Input is the search query."
 
     def _run(self, query: str) -> str:
         global VECTOR_DB_RETRIEVER
-        if VECTOR_DB_RETRIEVER is None:
-            return "Error: No PDF uploaded."
+        if VECTOR_DB_RETRIEVER is None: return "Error: No PDF loaded."
         try:
             docs = VECTOR_DB_RETRIEVER.invoke(query)
-            # Retorna o texto encontrado
             return "\n".join([d.page_content for d in docs])
-        except Exception:
-            return "No information found."
+        except: return "No info found."
 
 # ==============================================================================
-#  3. MODELO LLM (Local)
+#  3. LLM (Wrapper de Chat) - A SOLUÇÃO
 # ==============================================================================
-global_model = None
-global_tokenizer = None
+global_llm = None
 
-def initialize_model():
-    global global_model, global_tokenizer
-    if global_model: return global_model, global_tokenizer
+def load_llm():
+    global global_llm
+    if global_llm: return global_llm
 
     model_name = "microsoft/Phi-3.5-mini-instruct"
     
@@ -100,104 +96,103 @@ def initialize_model():
         device_map="auto",
         quantization_config=bnb_config,
     )
-    global_tokenizer = tokenizer
-    global_model = model
-    return global_model, global_tokenizer
 
-def load_llm():
-    model, tokenizer = initialize_model()
-    pipe = pipeline(
+    # 1. Pipeline Base
+    text_generation_pipeline = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
         max_new_tokens=1024,
         do_sample=True,
         temperature=0.1,
-        return_full_text=False
+        return_full_text=False,
+        # Importante para Phi-3.5 entender que é um chat
+        trust_remote_code=True 
     )
-    return HuggingFacePipeline(pipeline=pipe)
+
+    # 2. Converte Pipeline em LangChain LLM
+    hf_pipeline = HuggingFacePipeline(pipeline=text_generation_pipeline)
+
+    # 3. MÁGICA: Converte em "ChatModel" (Isso evita o fallback para OpenAI)
+    # O CrewAI adora modelos de Chat. Ao dar um ChatModel local, ele para de reclamar.
+    global_llm = ChatHuggingFace(llm=hf_pipeline)
+    
+    return global_llm
 
 # ==============================================================================
-#  4. AGENTES E TAREFAS (Configuração de 2 Agentes)
+#  4. AGENTES (Setup Linear)
 # ==============================================================================
 def create_agents_and_tasks(user_query):
     
     llm = load_llm()
-    
-    # Apenas o Agente 1 recebe a ferramenta de busca
     tools = [PDFRagTool()] if VECTOR_DB_RETRIEVER else []
 
-    # --- AGENTE 1: O CAÇADOR DE FATOS ---
+    # Agente 1: Pesquisa
     researcher = Agent(
-        role="Senior Researcher",
-        goal="Extract precise information from the PDF.",
-        backstory="You are an expert at finding facts in documents.",
+        role="Researcher",
+        goal="Find exact quotes in the PDF.",
+        backstory="Analytical researcher.",
         tools=tools,
         llm=llm,
         verbose=True,
-        allow_delegation=False, # Importante: Sem delegação
-        cache=False             # Importante: Sem cache
+        allow_delegation=False,
+        cache=False # Importante
     )
 
-    # --- AGENTE 2: O ESCRITOR ---
+    # Agente 2: Resposta
     writer = Agent(
-        role="Technical Writer",
-        goal="Write a clear, concise answer based on the Researcher's findings.",
-        backstory="You write easy-to-understand responses.",
-        tools=[], # Nenhuma ferramenta, ele apenas processa texto
+        role="Writer",
+        goal="Write a final answer.",
+        backstory="Technical writer.",
+        tools=[], 
         llm=llm,
         verbose=True,
-        allow_delegation=False, # Importante: Sem delegação
-        cache=False             # Importante: Sem cache
+        allow_delegation=False,
+        cache=False # Importante
     )
 
-    # --- TAREFAS ---
     task1 = Task(
-        description=f"Search the PDF for information regarding: '{user_query}'. Return the raw facts found.",
-        expected_output="A list of key facts and quotes from the text.",
+        description=f"Search PDF for: '{user_query}'. Return raw facts.",
+        expected_output="List of facts.",
         agent=researcher
     )
 
     task2 = Task(
-        description=f"Using the context provided by the Researcher, write a final answer for: '{user_query}'",
-        expected_output="A well-formatted text response.",
+        description=f"Answer '{user_query}' based on the facts.",
+        expected_output="Final text.",
         agent=writer
     )
 
-    # --- CREW ---
     return Crew(
         agents=[researcher, writer],
         tasks=[task1, task2],
-        process=Process.sequential, # Garante: Agente 1 -> Agente 2
+        process=Process.sequential,
         verbose=True,
-        memory=False,      # Desliga OpenAI Memory
-        cache=False,       # Desliga OpenAI Cache
-        manager_llm=None,  # Garante que não tem Manager
-        embedder={         # Redundância de segurança
+        memory=False, # Importante
+        cache=False,  # Importante
+        embedder={    # Força Embeddings Locais na config da Crew
              "provider": "huggingface",
              "config": {"model": "sentence-transformers/all-MiniLM-L6-v2"}
         }
     )
 
 # ==============================================================================
-#  5. INTERFACE GRADIO
+#  5. INTERFACE
 # ==============================================================================
 def process_pdf(file_obj):
     if not file_obj: return "Sem arquivo."
     try:
         path = file_obj.name if hasattr(file_obj, 'name') else file_obj
         build_vector_store(path)
-        return "PDF Indexado com Sucesso!"
-    except Exception as e:
-        return f"Erro: {e}"
+        return "PDF Pronto!"
+    except Exception as e: return f"Erro: {e}"
 
 @spaces.GPU(duration=120)
 def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    # Feedback visual para o usuário
-    history.append([message, "🤖 Agente 1 Pesquisando... -> ✍️ Agente 2 Escrevendo..."])
+    history.append([message, "🤖 Processando (Local)..."])
     yield history
 
     try:
@@ -209,14 +204,12 @@ def chat_function(message, history):
     
     yield history
 
-with gr.Blocks(title="Multi-Agent RAG Local") as demo:
-    gr.Markdown("# 🤖🤖 Multi-Agent RAG (Pesquisador + Escritor)")
-    
+with gr.Blocks(title="RAG Local Final") as demo:
+    gr.Markdown("# 🛡️ RAG Local (ChatWrapper Fix)")
     with gr.Row():
-        upl = gr.File(label="Upload PDF")
-        st = gr.Markdown("Aguardando PDF...")
-    
-    chat = gr.Chatbot(height=600)
+        upl = gr.File(label="PDF")
+        st = gr.Markdown("...")
+    chat = gr.Chatbot(height=550)
     msg = gr.Textbox(label="Pergunta")
     
     upl.change(process_pdf, upl, st)
