@@ -81,11 +81,11 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM CUSTOMIZADO (FILTRAGEM DE ARGUMENTOS)
+#  3. LLM CUSTOMIZADO (SANITIZAÇÃO DE KWARGS)
 # ==============================================================================
 class LocalQwen(LLM):
     """
-    LLM Local que remove argumentos incompatíveis (stop words)
+    LLM Local que remove argumentos incompatíveis (callbacks, tools)
     para evitar o crash do HuggingFace Pipeline.
     """
     model_name: str = "Qwen/Qwen2.5-7B-Instruct"
@@ -94,7 +94,7 @@ class LocalQwen(LLM):
     def _call(
         self,
         prompt: str,
-        stop: Optional[List[str]] = None, # CrewAI envia isso, mas quebra o pipeline
+        stop: Optional[List[str]] = None,
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
@@ -104,20 +104,24 @@ class LocalQwen(LLM):
             return "SYSTEM_ERROR: Modelo não carregado."
 
         try:
+            # --- LIMPEZA DE ARGUMENTOS (CRUCIAL) ---
+            # O CrewAI envia objetos complexos que o pipeline não entende.
+            # Removemos tudo que não for essencial.
+            kwargs.pop("callbacks", None) 
+            kwargs.pop("tools", None)
+            kwargs.pop("functions", None)
+            kwargs.pop("tool_choice", None)
+            
             # Formatação para Qwen (ChatML)
             formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
             
-            # --- O SEGREDO ESTÁ AQUI ---
-            # Nós IGNORAMOS o argumento 'stop' e 'kwargs' que o CrewAI manda.
-            # O Pipeline do Transformers não lida bem com listas de stop words dinâmicas
-            # em versões antigas ou configurações específicas.
             response = GLOBAL_PIPELINE(
                 formatted_prompt, 
                 max_new_tokens=1024, 
                 return_full_text=False, 
                 do_sample=True,
-                temperature=0.1
-                # Nota: Não passamos 'stop_sequence' aqui propositalmente.
+                temperature=0.1,
+                # stop_sequence=stop # Comentado por segurança
             )
             
             generated_text = response[0]['generated_text']
@@ -128,9 +132,8 @@ class LocalQwen(LLM):
             return generated_text
 
         except Exception as e:
-            # Captura erros de CUDA, Memória ou Tipo
+            # Captura erros reais e imprime no terminal
             print(f"\n!!! ERRO DENTRO DO LLM !!!\n{traceback.format_exc()}")
-            # Retorna o erro como string para não travar o CrewAI
             return f"INTERNAL_ERROR: {str(e)}"
 
     @property
@@ -191,7 +194,7 @@ def create_agents_and_tasks(user_query):
         verbose=True,
         allow_delegation=False,
         cache=False,
-        max_iter=2 # Mantém baixo para evitar loops
+        max_iter=3 
     )
 
     writer = Agent(
@@ -224,7 +227,8 @@ def create_agents_and_tasks(user_query):
         verbose=True,
         memory=False, 
         cache=False,
-        manager_llm=None, # Garante que não use Manager
+        manager_llm=None,
+        function_calling_llm=llm, # Força o uso do nosso LLM para tool calling também
         embedder={    
              "provider": "huggingface",
              "config": {"model": "sentence-transformers/all-MiniLM-L6-v2"}
@@ -258,8 +262,7 @@ def chat_function(message, history):
         history[-1] = [message, str(result.raw)]
     except Exception as e:
         msg = f"Erro no Chat: {str(e)}"
-        print(msg)
-        traceback.print_exc()
+        print(f"ERRO FINAL: {traceback.format_exc()}")
         history[-1] = [message, msg]
     
     yield history
