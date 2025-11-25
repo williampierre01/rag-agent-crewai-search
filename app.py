@@ -6,20 +6,21 @@ from typing import Any, List, Optional
 from crewai import Agent, Crew, Process, Task
 from crewai.tools import BaseTool
 
-# LangChain Imports
+# LangChain & Pydantic
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
+from pydantic import PrivateAttr
 
-# Transformers Imports
+# Transformers
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
 
 # ==============================================================================
-#  CONFIGURAÇÕES DE AMBIENTE
+#  CONFIGURAÇÕES
 # ==============================================================================
 os.environ["OPENAI_API_KEY"] = "sk-fake-key-bypass"
 os.environ["OTEL_SDK_DISABLED"] = "true"
@@ -62,7 +63,7 @@ def build_vector_store(pdf_path):
         return False
 
 # ==============================================================================
-#  2. FERRAMENTA CUSTOMIZADA
+#  2. FERRAMENTA
 # ==============================================================================
 class PDFRagTool(BaseTool):
     name: str = "SearchPDF"
@@ -76,14 +77,15 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM CUSTOMIZADO BLINDADO (A SOLUÇÃO)
+#  3. LLM CUSTOMIZADO (QWEN 2.5 - BLINDADO)
 # ==============================================================================
-class UnbreakableLLM(LLM):
+class LocalQwen(LLM):
     """
-    Uma classe LLM que engole qualquer erro e retorna como texto,
-    impedindo que o CrewAI tente fazer fallback para OpenAI.
+    Classe customizada para rodar o Qwen 2.5 localmente com CrewAI.
+    Usa PrivateAttr para evitar erros de validação do Pydantic.
     """
-    model_name: str = "microsoft/Phi-3.5-mini-instruct"
+    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    _is_dummy: bool = PrivateAttr(default=True)
 
     def _call(
         self,
@@ -92,54 +94,53 @@ class UnbreakableLLM(LLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
-        # Acessa a variável global
         global GLOBAL_PIPELINE
         
         if GLOBAL_PIPELINE is None:
-            return "SYSTEM_ERROR: O Modelo Global não está carregado na GPU."
+            return "Erro: O modelo ainda não foi carregado na memória GPU."
 
         try:
-            # 1. Formatação Manual (Simples e Eficaz)
-            # Removemos qualquer tentativa complexa de chat templates do LangChain
-            formatted_prompt = f"<|user|>\n{prompt}<|end|>\n<|assistant|>"
+            # Formatação para Qwen (ChatML)
+            # O CrewAI manda um prompt gigante com instruções. 
+            # Envolvemos tudo em tags de usuário para o Qwen processar.
+            formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
             
-            # 2. Execução
-            # Ignoramos **kwargs que o CrewAI manda (como callbacks complexos)
-            # Ignoramos 'stop' words pois o HF Pipeline as vezes trava com elas
+            # Geração
             response = GLOBAL_PIPELINE(
                 formatted_prompt, 
                 max_new_tokens=1024, 
                 return_full_text=False, 
                 do_sample=True,
-                temperature=0.1
+                temperature=0.1 # Baixa temperatura para seguir regras do CrewAI
             )
             
-            text = response[0]['generated_text']
-            # Limpeza
-            return text.replace("<|end|>", "").strip()
+            generated_text = response[0]['generated_text']
+            
+            # Limpeza de tags do Qwen
+            generated_text = generated_text.replace("<|im_end|>", "").strip()
+            
+            return generated_text
 
         except Exception as e:
-            # AQUI ESTÁ O TRUQUE:
-            # Imprimimos o erro no terminal (para você ver)
-            print("\n!!! ERRO DENTRO DO LLM !!!")
-            traceback.print_exc()
-            
-            # E retornamos uma string normal. 
-            # O CrewAI vai achar que essa foi a resposta do modelo e seguirá em frente.
-            return f"Desculpe, ocorreu um erro interno na geração: {str(e)}"
+            print("\n=== ERRO NO MODELO LOCAL ===")
+            traceback.print_exc() 
+            return f"SYSTEM_ERROR: {str(e)}"
 
     @property
     def _llm_type(self) -> str:
-        return "custom_unbreakable"
+        return "custom_local_qwen"
 
-# Carregamento Global
+# ==============================================================================
+#  CARREGAMENTO GLOBAL (MODELO 7B)
+# ==============================================================================
 def load_global_model():
     global GLOBAL_PIPELINE
     if GLOBAL_PIPELINE is not None: return
 
-    print("--- LOAD MODEL ---")
+    print("--- INICIANDO CARREGAMENTO DO QWEN 2.5 (7B) ---")
     try:
-        model_name = "microsoft/Phi-3.5-mini-instruct"
+        # Modelo muito mais inteligente que o Phi-3
+        model_name = "Qwen/Qwen2.5-7B-Instruct"
         
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -161,37 +162,39 @@ def load_global_model():
             model=model,
             tokenizer=tokenizer
         )
-        print("--- MODEL READY ---")
+        print("--- QWEN CARREGADO ---")
     except Exception as e:
-        print(f"FATAL ERROR LOADING MODEL: {e}")
+        print(f"ERRO AO CARREGAR MODELO: {e}")
         traceback.print_exc()
 
 # ==============================================================================
-#  4. AGENTES
+#  4. AGENTES (CREWAI)
 # ==============================================================================
 def create_agents_and_tasks(user_query):
+    # Carrega o modelo
     load_global_model()
     
-    # Usamos nossa classe blindada
-    llm = UnbreakableLLM()
+    # Instancia nossa classe segura
+    llm = LocalQwen()
     
     tools = [PDFRagTool()] if GLOBAL_VECTOR_DB else []
 
     researcher = Agent(
         role="Researcher",
-        goal="Find facts.",
-        backstory="Researcher.",
+        goal="Find specific facts in the PDF document.",
+        backstory="You are an expert analyst. You read the PDF using the tool and extract exact information.",
         tools=tools,
         llm=llm,
         verbose=True,
         allow_delegation=False,
         cache=False,
+        max_iter=3 
     )
 
     writer = Agent(
         role="Writer",
-        goal="Summarize.",
-        backstory="Writer.",
+        goal="Write a clear answer based on the facts found.",
+        backstory="You are a technical writer. You summarize the information found by the Researcher.",
         tools=[], 
         llm=llm,
         verbose=True,
@@ -200,14 +203,14 @@ def create_agents_and_tasks(user_query):
     )
 
     task1 = Task(
-        description=f"Search PDF for '{user_query}' and list facts.",
-        expected_output="Facts list.",
+        description=f"Use the SearchPDF tool to find information about: '{user_query}'. Extract the key facts.",
+        expected_output="A list of facts found in the document.",
         agent=researcher
     )
 
     task2 = Task(
-        description=f"Answer '{user_query}' based on facts.",
-        expected_output="Final answer.",
+        description=f"Using the facts provided, write a final answer to the question: '{user_query}'",
+        expected_output="A concise text answer.",
         agent=writer
     )
 
@@ -232,7 +235,7 @@ def process_pdf(file_obj):
     try:
         path = file_obj.name if hasattr(file_obj, 'name') else file_obj
         if build_vector_store(path):
-            return "PDF Indexado!"
+            return "PDF Indexado! Modelo Qwen pronto."
         else:
             return "Erro na indexação."
     except Exception as e: return f"Erro: {e}"
@@ -242,7 +245,7 @@ def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    history.append([message, "🤖 Iniciando..."])
+    history.append([message, "🤖 Agentes trabalhando (Qwen 7B)..."])
     yield history
 
     try:
@@ -250,15 +253,16 @@ def chat_function(message, history):
         result = crew.kickoff()
         history[-1] = [message, str(result.raw)]
     except Exception as e:
-        msg = f"Erro Crew: {str(e)}"
+        msg = f"Erro no Chat: {str(e)}"
         print(msg)
         traceback.print_exc()
         history[-1] = [message, msg]
     
     yield history
 
-with gr.Blocks(title="RAG Final Unbreakable") as demo:
-    gr.Markdown("# 🛡️ RAG Local (Unbreakable Version)")
+with gr.Blocks(title="CrewAI + Qwen Local") as demo:
+    gr.Markdown("# 🤖 CrewAI com Modelo Qwen 2.5 (Local)")
+    gr.Markdown("Usando Qwen-7B para maior estabilidade com Agentes.")
     with gr.Row():
         upl = gr.File(label="PDF")
         st = gr.Markdown("...")
