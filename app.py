@@ -1,26 +1,26 @@
 import gradio as gr
 import os
 import spaces
+from typing import Any, List, Optional
 from crewai import Agent, Crew, Process, Task
 from crewai.tools import BaseTool
 
-# RAG Imports
+# LangChain Imports
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from langchain.llms.base import LLM
+from langchain.callbacks.manager import CallbackManagerForLLMRun
 
-# LLM Imports
+# Transformers Imports
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
-from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
 
 # ==============================================================================
-#  CONFIGURAÇÃO "SPOOFING" (Anti-OpenAI)
+#  CONFIGURAÇÃO ANTI-ERRO
 # ==============================================================================
-os.environ["OPENAI_API_KEY"] = "sk-proj-fake-key-to-bypass-validation"
-os.environ["OPENAI_API_BASE"] = "http://127.0.0.1:11434/v1" 
-os.environ["OPENAI_MODEL_NAME"] = "microsoft/Phi-3.5-mini-instruct"
+os.environ["OPENAI_API_KEY"] = "sk-fake-key" # Apenas para calar validações
 os.environ["OTEL_SDK_DISABLED"] = "true"
 
 # ==============================================================================
@@ -70,13 +70,47 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM (CORREÇÃO AQUI)
+#  3. LLM CUSTOMIZADO (A SOLUÇÃO DEFINITIVA)
 # ==============================================================================
-global_llm = None
+# Criamos nossa própria classe para ter controle total e evitar fallbacks
+
+class LocalPhi3(LLM):
+    model_name: str = "microsoft/Phi-3.5-mini-instruct"
+    # Definimos os campos como Any para evitar validação estrita do Pydantic v1/v2
+    pipeline: Any = None 
+    tokenizer: Any = None
+
+    def _call(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        # Formatação Manual do Chat Prompt (Phi-3 Format)
+        # Isso garante que o modelo entenda quem é quem sem precisar de wrappers complexos
+        formatted_prompt = f"<|user|>\n{prompt}<|end|>\n<|assistant|>"
+        
+        # Gera a resposta
+        response = self.pipeline(
+            formatted_prompt, 
+            max_new_tokens=1024, 
+            return_full_text=False, 
+            do_sample=True,
+            temperature=0.1
+        )
+        return response[0]['generated_text']
+
+    @property
+    def _llm_type(self) -> str:
+        return "custom_local_phi3"
+
+# Carregador do Modelo
+global_llm_instance = None
 
 def load_llm():
-    global global_llm
-    if global_llm: return global_llm
+    global global_llm_instance
+    if global_llm_instance: return global_llm_instance
 
     model_name = "microsoft/Phi-3.5-mini-instruct"
     
@@ -95,28 +129,16 @@ def load_llm():
         trust_remote_code=True
     )
 
-    # 1. Pipeline Base
-    text_generation_pipeline = pipeline(
+    text_pipeline = pipeline(
         "text-generation",
         model=model,
-        tokenizer=tokenizer,
-        max_new_tokens=1024,
-        do_sample=True,
-        temperature=0.1,
-        return_full_text=False,
+        tokenizer=tokenizer
     )
 
-    # 2. Converte Pipeline em LangChain LLM
-    hf_pipeline = HuggingFacePipeline(pipeline=text_generation_pipeline)
-
-    # 3. CORREÇÃO CRÍTICA: Passamos o tokenizer explicitamente
-    # Isso impede o erro "Fallback to LiteLLM"
-    global_llm = ChatHuggingFace(
-        llm=hf_pipeline, 
-        tokenizer=tokenizer  # <--- LINHA NOVA IMPORTANTE
-    )
+    # Instanciamos nossa classe customizada
+    global_llm_instance = LocalPhi3(pipeline=text_pipeline, tokenizer=tokenizer)
     
-    return global_llm
+    return global_llm_instance
 
 # ==============================================================================
 #  4. AGENTES (Setup Linear)
@@ -191,7 +213,7 @@ def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    history.append([message, "🤖 Processando (Local)..."])
+    history.append([message, "🤖 Processando (Local Customizado)..."])
     yield history
 
     try:
@@ -204,7 +226,7 @@ def chat_function(message, history):
     yield history
 
 with gr.Blocks(title="RAG Local Final") as demo:
-    gr.Markdown("# 🛡️ RAG Local (Tokenizer Fix)")
+    gr.Markdown("# 🛡️ RAG Local (Custom Class Fix)")
     with gr.Row():
         upl = gr.File(label="PDF")
         st = gr.Markdown("...")
