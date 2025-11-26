@@ -3,7 +3,7 @@ import os
 import spaces
 import traceback
 import gc
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Dict
 from crewai import Agent, Crew, Process, Task
 from crewai.tools import BaseTool
 
@@ -14,17 +14,18 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
-from pydantic import PrivateAttr
+from pydantic import PrivateAttr, Field
 
 # Transformers Imports
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
 
 # ==============================================================================
-#  CONFIGURAÇÕES DE AMBIENTE
+#  CONFIGURAÇÕES DE AMBIENTE (CRÍTICAS)
 # ==============================================================================
 os.environ["OPENAI_API_KEY"] = "NA"
 os.environ["OTEL_SDK_DISABLED"] = "true"
+os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true" # Desliga telemetria para evitar conexões
 
 # ==============================================================================
 #  GLOBAL STATE
@@ -33,7 +34,7 @@ GLOBAL_VECTOR_DB = None
 GLOBAL_PIPELINE = None 
 
 # ==============================================================================
-#  1. BANCO VETORIAL (RAG) - VERSÃO OTIMIZADA PARA MEMÓRIA
+#  1. BANCO VETORIAL (RAG)
 # ==============================================================================
 @spaces.GPU
 def build_vector_store(pdf_path):
@@ -41,16 +42,13 @@ def build_vector_store(pdf_path):
     print(f"[RAG] Indexando: {pdf_path}")
     
     try:
-        # Limpeza agressiva de memória
         torch.cuda.empty_cache()
         gc.collect()
 
         loader = PyPDFLoader(pdf_path)
         docs = loader.load()
         
-        # --- OTIMIZAÇÃO: CHUNKS MENORES ---
-        # Reduzi para 600 chars. Isso evita estourar a memória do Qwen.
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
         splits = text_splitter.split_documents(docs)
 
         embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -62,9 +60,7 @@ def build_vector_store(pdf_path):
             persist_directory=None
         )
         
-        # --- OTIMIZAÇÃO: MENOS CONTEXTO ---
-        # k=2 pega apenas os 2 trechos mais importantes.
-        GLOBAL_VECTOR_DB = vectorstore.as_retriever(search_kwargs={"k": 2})
+        GLOBAL_VECTOR_DB = vectorstore.as_retriever(search_kwargs={"k": 3})
         return True
     except Exception as e:
         print(f"[ERRO RAG] {e}")
@@ -86,7 +82,7 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM CUSTOMIZADO (ANTI-LOOP & ANTI-CRASH)
+#  3. LLM CUSTOMIZADO (CORREÇÃO DE ARGUMENTOS)
 # ==============================================================================
 class LocalQwen(LLM):
     model_name: str = "Qwen/Qwen2.5-7B-Instruct"
@@ -99,39 +95,49 @@ class LocalQwen(LLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
+        """
+        Esta função agora aceita explicitamente 'stop' e '**kwargs' 
+        para evitar erro de assinatura de método.
+        """
         global GLOBAL_PIPELINE
         
         if GLOBAL_PIPELINE is None:
             return "SYSTEM_ERROR: Modelo não carregado."
 
         try:
-            # Limpeza TOTAL de argumentos que o CrewAI manda e quebram o pipeline
-            clean_kwargs = {
+            # 1. Limpeza: Ignoramos 'stop' e 'callbacks' pois eles quebram o pipeline local
+            # Definimos apenas o que o pipeline do HF precisa.
+            generation_kwargs = {
                 "max_new_tokens": 1024,
                 "return_full_text": False,
                 "do_sample": True,
                 "temperature": 0.1,
-                "repetition_penalty": 1.1 # <--- IMPORTANTE: Evita loops infinitos
+                "repetition_penalty": 1.1
             }
 
-            # Formatação ChatML
+            # 2. Formatação do Prompt
+            # Envolvemos o prompt do CrewAI no formato ChatML do Qwen
             formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
             
-            response = GLOBAL_PIPELINE(formatted_prompt, **clean_kwargs)
+            # 3. Execução
+            response = GLOBAL_PIPELINE(formatted_prompt, **generation_kwargs)
             
             generated_text = response[0]['generated_text']
+            
+            # 4. Limpeza da Resposta
+            # Removemos tokens de fim de geração para não confundir o parser
             generated_text = generated_text.replace("<|im_end|>", "").strip()
             
-            # Se gerar vazio, retorna algo para não quebrar o parser
             if not generated_text:
-                return "I completed the task."
+                return "Task completed."
 
             return generated_text
 
         except Exception as e:
-            print(f"\n!!! ERRO NO LLM !!!\n{traceback.format_exc()}")
-            # Retorno amigável que engana o CrewAI e evita o Fallback
-            return f"Note: I encountered an internal error: {str(e)}. I will try to proceed with what I know."
+            error_msg = f"INTERNAL_ERROR: {str(e)}"
+            print(f"\n!!! ERRO LLM !!!\n{traceback.format_exc()}")
+            # Retorna o erro como texto para evitar crash
+            return error_msg
 
     @property
     def _llm_type(self) -> str:
@@ -144,7 +150,7 @@ def load_global_model():
     global GLOBAL_PIPELINE
     if GLOBAL_PIPELINE is not None: return
 
-    print("--- INICIANDO CARREGAMENTO DO QWEN ---")
+    print("--- LOAD QWEN 7B ---")
     try:
         model_name = "Qwen/Qwen2.5-7B-Instruct"
         
@@ -168,38 +174,39 @@ def load_global_model():
             model=model,
             tokenizer=tokenizer
         )
-        print("--- QWEN CARREGADO ---")
+        print("--- QWEN READY ---")
     except Exception as e:
-        print(f"ERRO AO CARREGAR MODELO: {e}")
+        print(f"FATAL ERROR: {e}")
         traceback.print_exc()
 
 # ==============================================================================
-#  4. AGENTES (CREWAI SIMPLIFICADO)
+#  4. AGENTES
 # ==============================================================================
 def create_agents_and_tasks(user_query):
     load_global_model()
+    
     llm = LocalQwen()
     
-    # Se o PDF não estiver carregado, rodamos sem tools para não quebrar
+    # Se não tiver PDF, lista vazia de ferramentas
     tools = [PDFRagTool()] if GLOBAL_VECTOR_DB else []
 
     researcher = Agent(
         role="Analyst",
-        goal="Extract facts from the PDF.",
+        goal="Extract information.",
         backstory="Analyst.",
         tools=tools,
         llm=llm,
         verbose=True,
         allow_delegation=False,
         cache=False,
-        max_iter=2 # Mínimo possível
+        max_iter=2 
     )
 
     writer = Agent(
         role="Writer",
-        goal="Write the answer.",
+        goal="Write answer.",
         backstory="Writer.",
-        tools=[], 
+        tools=[], # Escritor não usa ferramentas, só texto
         llm=llm,
         verbose=True,
         allow_delegation=False,
@@ -207,14 +214,14 @@ def create_agents_and_tasks(user_query):
     )
 
     task1 = Task(
-        description=f"Read the PDF and find facts about: '{user_query}'",
-        expected_output="List of facts.",
+        description=f"Analyze the request: '{user_query}'. If it requires the PDF, use SearchPDF. If not, answer directly.",
+        expected_output="Information or answer.",
         agent=researcher
     )
 
     task2 = Task(
-        description=f"Answer '{user_query}' based on facts.",
-        expected_output="Text answer.",
+        description=f"Finalize the answer for the user based on the Analyst's output.",
+        expected_output="Final text.",
         agent=writer
     )
 
@@ -240,7 +247,7 @@ def process_pdf(file_obj):
     try:
         path = file_obj.name if hasattr(file_obj, 'name') else file_obj
         if build_vector_store(path):
-            return "PDF Indexado! (Memória Otimizada)"
+            return "PDF Indexado!"
         else:
             return "Erro na indexação."
     except Exception as e: return f"Erro: {e}"
@@ -250,7 +257,7 @@ def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    history.append([message, "🤖 Agentes Trabalhando..."])
+    history.append([message, "🤖 Processando..."])
     yield history
 
     try:
@@ -264,8 +271,8 @@ def chat_function(message, history):
     
     yield history
 
-with gr.Blocks(title="CrewAI + Qwen Local (Stable)") as demo:
-    gr.Markdown("# 🤖 CrewAI + Qwen (Versão Estável)")
+with gr.Blocks(title="CrewAI Final Fix") as demo:
+    gr.Markdown("# 🤖 CrewAI + Qwen (Argument Fix)")
     
     with gr.Row():
         upl = gr.File(label="Upload PDF")
