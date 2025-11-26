@@ -4,7 +4,7 @@ import spaces
 import torch
 import gc
 import traceback
-from smolagents import CodeAgent, Tool, TransformersModel
+from smolagents import CodeAgent, Tool, Model
 
 # Imports de RAG
 from langchain_community.document_loaders import PyPDFLoader
@@ -12,7 +12,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
-# Imports Transformers (Para criar o Pipeline Manualmente)
+# Imports Transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
 
 # ==============================================================================
@@ -22,7 +22,57 @@ GLOBAL_RETRIEVER = None
 GLOBAL_ENGINE = None 
 
 # ==============================================================================
-#  1. ENGINE OFICIAL COM PIPELINE INJETADO (A SOLUÇÃO)
+#  1. ENGINE CUSTOMIZADA (CORREÇÃO FINAL E DEFINITIVA)
+# ==============================================================================
+class LocalQwenEngine(Model):
+    """
+    Esta classe implementa TUDO o que o smolagents exige, mas com controle manual
+    sobre a geração para evitar erros de argumentos.
+    """
+    def __init__(self, pipeline_obj):
+        super().__init__()
+        self.pipeline = pipeline_obj
+        self.tokenizer_obj = pipeline_obj.tokenizer
+
+    # --- CORREÇÃO DO ERRO "METHOD MUST BE IMPLEMENTED" ---
+    # A biblioteca exige que este método exista.
+    def get_tokenizer(self):
+        return self.tokenizer_obj
+
+    # --- CORREÇÃO DO ERRO "KWARGS" ---
+    def __call__(self, messages, stop_sequences=None, grammar=None, **kwargs):
+        """
+        Recebe as mensagens, limpa os argumentos proibidos e chama o pipeline.
+        """
+        # 1. Limpeza de Argumentos
+        # Removemos 'pipeline' e outros lixos que causam o crash
+        clean_kwargs = {
+            k: v for k, v in kwargs.items() 
+            if k not in ['pipeline', 'grammar', 'stop_sequences', 'adapter_id']
+        }
+
+        # 2. Formatação do Chat
+        prompt = self.tokenizer_obj.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+
+        # 3. Geração
+        outputs = self.pipeline(
+            prompt,
+            max_new_tokens=2048,
+            do_sample=True,
+            temperature=0.1,
+            top_p=0.95,
+            **clean_kwargs
+        )
+
+        # 4. Retorno
+        return outputs[0]["generated_text"]
+
+# ==============================================================================
+#  2. CARREGAMENTO (SETUP)
 # ==============================================================================
 def get_or_create_engine():
     global GLOBAL_ENGINE
@@ -33,17 +83,14 @@ def get_or_create_engine():
     
     model_id = "Qwen/Qwen2.5-7B-Instruct"
     
-    # 1. Configuração de Memória (4-bit)
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    # 2. Tokenizador
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     
-    # 3. Modelo
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=bnb_config,
@@ -51,31 +98,23 @@ def get_or_create_engine():
         trust_remote_code=True
     )
 
-    # 4. Pipeline (A Ponte Segura)
-    # Configuramos aqui para não dar erro de kwargs depois
     text_pipeline = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=2048,
-        do_sample=True,
-        temperature=0.1,
-        top_p=0.95,
-        return_full_text=False # Importante para agentes
+        return_full_text=False 
     )
 
-    # 5. Injeção no Wrapper Oficial
-    # Passamos o pipeline PRONTO. O smolagents usa ele sem tentar recarregar nada.
-    GLOBAL_ENGINE = TransformersModel(pipeline=text_pipeline)
+    # Instanciamos nossa classe manual COMPLETA
+    GLOBAL_ENGINE = LocalQwenEngine(pipeline_obj=text_pipeline)
     
     print("--- ENGINE PRONTA ---")
     return GLOBAL_ENGINE
 
 # ==============================================================================
-#  2. FERRAMENTAS E ADAPTADORES
+#  3. FERRAMENTAS E AGENTES
 # ==============================================================================
 
-# Ferramenta de PDF
 class PDFSearchTool(Tool):
     name = "search_pdf"
     description = "Search for specific information within the uploaded PDF document."
@@ -91,14 +130,13 @@ class PDFSearchTool(Tool):
             return "\n\n".join([f"--- Content ---\n{doc.page_content}" for doc in docs])
         except Exception as e: return f"Error: {str(e)}"
 
-# Classe para Agente como Ferramenta (Manual ManagedAgent)
 class AgentAsTool(Tool):
     def __init__(self, agent, name, description):
         self.agent = agent
         self.name = name
         self.description = description
         self.inputs = {
-            "task": {"type": "string", "description": "The question for the agent."}
+            "task": {"type": "string", "description": "The task for the agent."}
         }
         self.output_type = "string"
         super().__init__()
@@ -109,14 +147,10 @@ class AgentAsTool(Tool):
         except Exception as e:
             return f"Error: {str(e)}"
 
-# ==============================================================================
-#  3. SISTEMA MULTI-AGENTE
-# ==============================================================================
 def get_manager_agent():
-    # Garante que a engine existe
     engine = get_or_create_engine()
 
-    # 1. Agente Pesquisador (Sub-Agente)
+    # Pesquisador
     researcher = CodeAgent(
         tools=[PDFSearchTool()],
         model=engine,
@@ -125,14 +159,14 @@ def get_manager_agent():
         description="Reads PDFs."
     )
 
-    # 2. Ferramenta Pesquisador
+    # Ferramenta Pesquisador
     researcher_tool = AgentAsTool(
         agent=researcher,
         name="ask_researcher",
-        description="Ask the Researcher to find info in the PDF."
+        description="Use this to find info in the PDF."
     )
 
-    # 3. Agente Gerente (Principal)
+    # Gerente
     manager = CodeAgent(
         tools=[researcher_tool],
         model=engine,
@@ -146,8 +180,7 @@ def get_manager_agent():
 @spaces.GPU
 def build_vector_store(pdf_path):
     global GLOBAL_RETRIEVER
-    # Força carregamento do modelo agora
-    get_or_create_engine()
+    get_or_create_engine() # Carrega modelo
     
     print(f"[RAG] Indexando: {pdf_path}")
     try:
