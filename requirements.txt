@@ -1,4 +1,4 @@
-smolagents
+git+https://github.com/huggingface/smolagents.git
 crewai
 crewai-tools
 markitdown
@@ -21,3 +21,4 @@ pydantic
 litellm
 duckduckgo-search
 mcp
+ddgs
