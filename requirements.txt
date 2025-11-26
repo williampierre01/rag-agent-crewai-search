@@ -20,3 +20,4 @@ gradio
 pydantic
 litellm
 duckduckgo-search
+mcp
