@@ -3,7 +3,7 @@ import os
 import spaces
 import torch
 import gc
-from smolagents import CodeAgent, TransformersModel, Tool, DuckDuckGoSearchTool
+from smolagents import CodeAgent, Tool, ManagedAgent, Model
 
 # Imports de RAG
 from langchain_community.document_loaders import PyPDFLoader
@@ -11,14 +11,92 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
+# Imports Transformers (Para carregamento manual seguro)
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
 # ==============================================================================
 #  ESTADO GLOBAL
 # ==============================================================================
 GLOBAL_RETRIEVER = None
-GLOBAL_MODEL = None 
+GLOBAL_ENGINE = None 
 
 # ==============================================================================
-#  1. FERRAMENTA DE PDF
+#  1. CLASSE DE MODELO CUSTOMIZADA (A CORREÇÃO)
+# ==============================================================================
+class LocalQwenEngine(Model):
+    """
+    Esta classe carrega o modelo manualmente para garantir que o 4-bit funcione
+    sem causar erros na hora da geração de texto.
+    """
+    def __init__(self, model_id="Qwen/Qwen2.5-7B-Instruct"):
+        super().__init__()
+        self.model_id = model_id
+        self.tokenizer = None
+        self.model = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Carregamento inicial (Lazy loading será feito na primeira chamada ou via build)
+        print(f"Engine inicializada para {model_id}")
+
+    def load(self):
+        if self.model is not None:
+            return
+
+        print("--- CARREGANDO QWEN 2.5 (4-BIT) MANUALMENTE ---")
+        
+        # Configuração de Memória (4-bit)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_id,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        print("--- MODELO CARREGADO ---")
+
+    def __call__(self, messages, stop_sequences=None, **kwargs):
+        # Garante que está carregado
+        self.load()
+        
+        # Aplica o template de chat do Qwen (User/Assistant)
+        # O smolagents envia uma lista de mensagens (dicionários)
+        text_prompt = self.tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        # Tokeniza
+        model_inputs = self.tokenizer([text_prompt], return_tensors="pt").to(self.model.device)
+        
+        # Gera a resposta
+        # Removemos argumentos perigosos que possam vir do kwargs
+        clean_kwargs = {k: v for k, v in kwargs.items() if k != 'load_in_4bit'}
+        
+        generated_ids = self.model.generate(
+            **model_inputs,
+            max_new_tokens=1024,
+            do_sample=True,
+            temperature=0.1,
+            **clean_kwargs
+        )
+        
+        # Decodifica apenas a parte nova (a resposta)
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        response = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        return response
+
+# ==============================================================================
+#  2. FERRAMENTA DE PDF
 # ==============================================================================
 class PDFSearchTool(Tool):
     name = "search_pdf"
@@ -45,89 +123,54 @@ class PDFSearchTool(Tool):
             return f"Error searching PDF: {str(e)}"
 
 # ==============================================================================
-#  2. CARREGAMENTO DO MODELO
+#  3. CRIAÇÃO DOS AGENTES
 # ==============================================================================
-def load_model():
-    global GLOBAL_MODEL
-    if GLOBAL_MODEL is not None:
-        return GLOBAL_MODEL
-        
-    print("--- CARREGANDO QWEN 2.5 NA GPU ---")
-    GLOBAL_MODEL = TransformersModel(
-        model_id="Qwen/Qwen2.5-7B-Instruct",
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        load_in_4bit=True,
-        max_new_tokens=1024
-    )
-    return GLOBAL_MODEL
-
-# ==============================================================================
-#  3. AGENTES (SOLUÇÃO SEM ManagedAgent)
-# ==============================================================================
-
-# --- CLASSE ESPECIAL: AGENTE COMO FERRAMENTA ---
-# Isso substitui o ManagedAgent. Envolvemos um agente dentro de uma Tool.
-class AgentAsTool(Tool):
-    def __init__(self, agent, name, description):
-        self.agent = agent
-        self.name = name
-        self.description = description
-        self.inputs = {
-            "task": {
-                "type": "string",
-                "description": "The task or question to delegate to this agent."
-            }
-        }
-        self.output_type = "string"
-        super().__init__()
-
-    def forward(self, task: str) -> str:
-        try:
-            return str(self.agent.run(task))
-        except Exception as e:
-            return f"Error from sub-agent: {str(e)}"
-
 def get_multi_agent_system():
-    model = load_model()
+    # Usa nossa engine customizada
+    global GLOBAL_ENGINE
+    if GLOBAL_ENGINE is None:
+        GLOBAL_ENGINE = LocalQwenEngine()
+        GLOBAL_ENGINE.load() # Força carregamento
 
-    # 1. Agente Pesquisador (PDF + Web)
+    # --- CLASSE PARA AGENTE-COMO-FERRAMENTA (Compatibilidade) ---
+    class AgentAsTool(Tool):
+        def __init__(self, agent, name, description):
+            self.agent = agent
+            self.name = name
+            self.description = description
+            self.inputs = {"task": {"type": "string", "description": "The question."}}
+            self.output_type = "string"
+            super().__init__()
+
+        def forward(self, task: str) -> str:
+            try:
+                return str(self.agent.run(task))
+            except Exception as e:
+                return f"Error: {str(e)}"
+
+    # 1. Agente Pesquisador
     retriever = CodeAgent(
-        tools=[PDFSearchTool(), DuckDuckGoSearchTool()],
-        model=model,
+        tools=[PDFSearchTool()],
+        model=GLOBAL_ENGINE,
         add_base_tools=False,
-        description="A meticulous analyst that searches PDF and Web."
+        description="Analyst that reads PDFs."
     )
 
-    # 2. Transformamos o Pesquisador em uma Ferramenta
-    # Assim o Gerente pode "usá-lo" como se fosse uma calculadora ou busca.
+    # 2. Ferramenta Pesquisador
     researcher_tool = AgentAsTool(
         agent=retriever,
         name="ask_researcher",
-        description="Use this tool to ask the Researcher Agent to find information. Give it a detailed question."
+        description="Ask the Researcher to find information in the PDF."
     )
 
-    # 3. Agente Gerente (Synthesizer)
-    # Ele recebe a ferramenta 'ask_researcher'
-    
-    system_prompt = """
-    You are a Senior Response Synthesizer.
-    Your goal is to answer the user's question clearly.
-    
-    You have a powerful tool called 'ask_researcher'.
-    ALWAYS delegate the research to 'ask_researcher' first.
-    
-    If the researcher returns information, summarize it nicely.
-    If the researcher fails, apologize.
-    """
-    
+    # 3. Agente Gerente
     manager = CodeAgent(
-        tools=[researcher_tool], # O agente virou ferramenta aqui
-        model=model,
+        tools=[researcher_tool],
+        model=GLOBAL_ENGINE,
         add_base_tools=False
     )
     
-    return manager, system_prompt
+    return manager
 
 # ==============================================================================
 #  4. INDEXAÇÃO
@@ -135,6 +178,7 @@ def get_multi_agent_system():
 @spaces.GPU
 def build_vector_store(pdf_path):
     global GLOBAL_RETRIEVER
+    global GLOBAL_ENGINE
     print(f"[RAG] Indexando: {pdf_path}")
     
     try:
@@ -157,7 +201,12 @@ def build_vector_store(pdf_path):
         )
         
         GLOBAL_RETRIEVER = vectorstore.as_retriever(search_kwargs={"k": 3})
-        load_model()
+        
+        # Pré-carrega o modelo
+        if GLOBAL_ENGINE is None:
+            GLOBAL_ENGINE = LocalQwenEngine()
+        GLOBAL_ENGINE.load()
+        
         return True
     except Exception as e:
         print(f"[ERRO RAG] {e}")
@@ -171,20 +220,27 @@ def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    history.append([message, "🤖 Gerente delegando para Pesquisador..."])
+    history.append([message, "🤖 Gerente pensando (Qwen 7B)..."])
     yield history
 
     try:
-        manager, prompt = get_multi_agent_system()
+        manager = get_multi_agent_system()
         
-        full_msg = f"{prompt}\n\nUSER QUESTION: {message}"
+        # Prompt do sistema manual para guiar o gerente
+        system_instruction = """
+        You are a Manager. You have a tool 'ask_researcher'.
+        1. If the user asks about the document, use 'ask_researcher'.
+        2. If the user greets you, just reply nicely.
         
-        response = manager.run(full_msg)
+        User Question:
+        """
+        
+        response = manager.run(f"{system_instruction} {message}")
         
         history[-1] = [message, str(response)]
         
     except Exception as e:
-        error_msg = f"Erro na execução: {str(e)}"
+        error_msg = f"Erro: {str(e)}"
         print(error_msg)
         history[-1] = [message, error_msg]
     
@@ -198,14 +254,14 @@ def process_pdf(file_obj):
     try:
         path = file_obj.name if hasattr(file_obj, 'name') else file_obj
         if build_vector_store(path):
-            return "PDF Indexado! Agentes Prontos."
+            return "PDF Indexado! Qwen 2.5 pronto."
         else:
             return "Erro ao indexar PDF."
     except Exception as e: return f"Erro: {e}"
 
-with gr.Blocks(title="SmolAgents Multi v2") as demo:
-    gr.Markdown("# 🧠 Multi-Agent RAG (Stable Version)")
-    gr.Markdown("Manager ➡️ Researcher (PDF + Web)")
+with gr.Blocks(title="SmolAgents Custom") as demo:
+    gr.Markdown("# 🧠 Multi-Agent RAG (Custom Engine)")
+    gr.Markdown("Correção para rodar Qwen 7B (4-bit) sem erros de kwargs.")
     
     with gr.Row():
         with gr.Column(scale=1):
