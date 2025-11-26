@@ -1,60 +1,129 @@
-import os
-
-# ==============================================================================
-#  CONFIGURAÇÕES DE AMBIENTE (DEVEM FICAR NO TOPO ABSOLUTO)
-# ==============================================================================
-# Definimos isso ANTES de importar qualquer biblioteca para garantir que
-# o CrewAI/LiteLLM carreguem essas configurações ao iniciar.
-
-# 1. Chave Falsa (mas com formato que engana validadores regex)
-os.environ["OPENAI_API_KEY"] = "sk-proj-fake-key-for-local-execution-12345"
-
-# 2. Redirecionamento para "Buraco Negro" Local
-# Dizemos que a API da OpenAI está no próprio container (onde não tem nada).
-# Assim, qualquer tentativa de conexão morre instantaneamente sem sair para a internet (evitando erro 401).
-os.environ["OPENAI_API_BASE"] = "http://127.0.0.1:11434/v1"
-
-# 3. Desativar Monitoramento e Telemetria (Evita conexões externas)
-os.environ["OTEL_SDK_DISABLED"] = "true"
-os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
-os.environ["SCARF_NO_ANALYTICS"] = "true"
-
-# ==============================================================================
-#  IMPORTS (SÓ AGORA IMPORTAMOS O RESTO)
-# ==============================================================================
 import gradio as gr
+import os
 import spaces
-import traceback
+import torch
 import gc
-from typing import Any, List, Optional
-from crewai import Agent, Crew, Process, Task
-from crewai.tools import BaseTool
+from smolagents import CodeAgent, TransformersModel, Tool, ManagedAgent, DuckDuckGoSearchTool
 
-# LangChain
+# Imports de RAG
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain_core.language_models.llms import LLM
-from langchain_core.callbacks.manager import CallbackManagerForLLMRun
-from pydantic import PrivateAttr
-
-# Transformers
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-import torch
 
 # ==============================================================================
-#  GLOBAL STATE
+#  ESTADO GLOBAL
 # ==============================================================================
-GLOBAL_VECTOR_DB = None
-GLOBAL_PIPELINE = None 
+GLOBAL_RETRIEVER = None
+GLOBAL_MODEL = None 
 
 # ==============================================================================
-#  1. BANCO VETORIAL (RAG)
+#  1. FERRAMENTA DE PDF
+# ==============================================================================
+class PDFSearchTool(Tool):
+    name = "search_pdf"
+    description = "Search for specific information within the uploaded PDF document."
+    inputs = {
+        "query": {
+            "type": "string",
+            "description": "The specific question or keywords to search for in the PDF."
+        }
+    }
+    output_type = "string"
+
+    def forward(self, query: str) -> str:
+        global GLOBAL_RETRIEVER
+        if GLOBAL_RETRIEVER is None:
+            return "Error: No PDF uploaded."
+        
+        try:
+            docs = GLOBAL_RETRIEVER.invoke(query)
+            if not docs:
+                return "No relevant information found in the PDF."
+            return "\n\n".join([f"--- Content ---\n{doc.page_content}" for doc in docs])
+        except Exception as e:
+            return f"Error searching PDF: {str(e)}"
+
+# ==============================================================================
+#  2. CARREGAMENTO DO MODELO (SINGLETON)
+# ==============================================================================
+def load_model():
+    global GLOBAL_MODEL
+    if GLOBAL_MODEL is not None:
+        return GLOBAL_MODEL
+        
+    print("--- CARREGANDO QWEN 2.5 NA GPU ---")
+    GLOBAL_MODEL = TransformersModel(
+        model_id="Qwen/Qwen2.5-7B-Instruct",
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+        load_in_4bit=True,
+        max_new_tokens=1024
+    )
+    return GLOBAL_MODEL
+
+# ==============================================================================
+#  3. CRIAÇÃO DOS AGENTES (PDF + WEB)
+# ==============================================================================
+def get_multi_agent_system():
+    model = load_model()
+
+    # --- INSTANCIAR FERRAMENTAS ---
+    pdf_tool = PDFSearchTool()
+    web_tool = DuckDuckGoSearchTool() # Ferramenta de Busca Web Gratuita
+
+    # --- AGENTE 1: RETRIEVER AGENT ---
+    # Agora ele tem DUAS ferramentas: PDF e Web.
+    retriever = CodeAgent(
+        tools=[pdf_tool, web_tool],
+        model=model,
+        name="retriever_agent",
+        description="""You are a meticulous analyst. 
+        Your goal is to retrieve the most relevant information.
+        IMPORTANT:
+        1. ALWAYS try to use the 'search_pdf' tool FIRST.
+        2. ONLY if the PDF tool returns no results or insufficient info, then use the 'web_search' tool.
+        """,
+        add_base_tools=False
+    )
+
+    managed_retriever = ManagedAgent(
+        agent=retriever,
+        name="retriever_agent",
+        description="Call this agent to retrieve information. It can check the PDF and the Web."
+    )
+
+    # --- AGENTE 2: RESPONSE SYNTHESIZER (MANAGER) ---
+    system_prompt_synthesizer = """
+    You are the 'response_synthesizer_agent'.
+    
+    BACKSTORY:
+    You're a skilled communicator with a knack for turning complex information into clear and concise responses.
+    
+    GOAL:
+    Synthesize the retrieved information into a concise and coherent response based on the user query.
+    
+    INSTRUCTIONS:
+    1. Delegate the research to 'retriever_agent'.
+    2. If the retriever finds information (from PDF or Web), summarize it clearly.
+    3. If the retriever fails completely (nothing in PDF and nothing on Web), respond with: "I'm sorry, I couldn't find the information you're looking for."
+    """
+
+    synthesizer_agent = CodeAgent(
+        tools=[], 
+        managed_agents=[managed_retriever],
+        model=model,
+        add_base_tools=False
+    )
+    
+    return synthesizer_agent, system_prompt_synthesizer
+
+# ==============================================================================
+#  4. INDEXAÇÃO (RAG)
 # ==============================================================================
 @spaces.GPU
 def build_vector_store(pdf_path):
-    global GLOBAL_VECTOR_DB
+    global GLOBAL_RETRIEVER
     print(f"[RAG] Indexando: {pdf_path}")
     
     try:
@@ -64,7 +133,6 @@ def build_vector_store(pdf_path):
         loader = PyPDFLoader(pdf_path)
         docs = loader.load()
         
-        # Chunks médios para balancear contexto e memória
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
         splits = text_splitter.split_documents(docs)
 
@@ -77,210 +145,67 @@ def build_vector_store(pdf_path):
             persist_directory=None
         )
         
-        GLOBAL_VECTOR_DB = vectorstore.as_retriever(search_kwargs={"k": 3})
+        GLOBAL_RETRIEVER = vectorstore.as_retriever(search_kwargs={"k": 3})
+        load_model()
         return True
     except Exception as e:
         print(f"[ERRO RAG] {e}")
-        traceback.print_exc()
         return False
 
 # ==============================================================================
-#  2. FERRAMENTA
+#  5. CHAT FUNCTION
 # ==============================================================================
-class PDFRagTool(BaseTool):
-    name: str = "SearchPDF"
-    description: str = "Search the PDF content. Input is the search query."
-
-    def _run(self, query: str) -> str:
-        if GLOBAL_VECTOR_DB is None: return "Error: No PDF loaded."
-        try:
-            docs = GLOBAL_VECTOR_DB.invoke(query)
-            return "\n".join([d.page_content for d in docs])
-        except: return "No info found."
-
-# ==============================================================================
-#  3. LLM CUSTOMIZADO (LOCAL QWEN)
-# ==============================================================================
-class LocalQwen(LLM):
-    """
-    LLM Local usando Qwen 2.5 7B.
-    Finge ser 'gpt-3.5-turbo' para passar nas validações do CrewAI,
-    mas roda localmente no Pipeline do HuggingFace.
-    """
-    model_name: str = "gpt-3.5-turbo" 
-    _is_dummy: bool = PrivateAttr(default=True)
-
-    def _call(
-        self,
-        prompt: str,
-        stop: Optional[List[str]] = None,
-        run_manager: Optional[CallbackManagerForLLMRun] = None,
-        **kwargs: Any,
-    ) -> str:
-        global GLOBAL_PIPELINE
-        
-        if GLOBAL_PIPELINE is None:
-            return "SYSTEM_ERROR: O modelo Qwen não está carregado na memória."
-
-        try:
-            # 1. Limpeza de Argumentos
-            # O CrewAI tenta passar callbacks e stops que o pipeline não aceita.
-            # Filtramos apenas os parâmetros de geração seguros.
-            gen_config = {
-                "max_new_tokens": 1024,
-                "return_full_text": False,
-                "do_sample": True,
-                "temperature": 0.1,
-                "repetition_penalty": 1.1
-            }
-
-            # 2. Formatação do Prompt (ChatML)
-            formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-            
-            # 3. Execução
-            response = GLOBAL_PIPELINE(formatted_prompt, **gen_config)
-            
-            generated_text = response[0]['generated_text']
-            
-            # 4. Limpeza da Resposta
-            generated_text = generated_text.replace("<|im_end|>", "").strip()
-            
-            if not generated_text:
-                return "Task completed."
-
-            return generated_text
-
-        except Exception as e:
-            # Captura erros internos (memória, cuda) e retorna como texto
-            print(f"\n!!! ERRO INTERNO NO LLM !!!\n{traceback.format_exc()}")
-            return f"Note: I encountered an internal error ({str(e)}). I will proceed with available information."
-
-    @property
-    def _llm_type(self) -> str:
-        return "custom_local_qwen"
-
-# ==============================================================================
-#  CARREGAMENTO GLOBAL
-# ==============================================================================
-def load_global_model():
-    global GLOBAL_PIPELINE
-    if GLOBAL_PIPELINE is not None: return
-
-    print("--- CARREGANDO QWEN 7B (4-BIT) ---")
-    try:
-        model_name = "Qwen/Qwen2.5-7B-Instruct"
-        
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            quantization_config=bnb_config,
-            trust_remote_code=True
-        )
-
-        GLOBAL_PIPELINE = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer
-        )
-        print("--- QWEN PRONTO ---")
-    except Exception as e:
-        print(f"ERRO AO CARREGAR MODELO: {e}")
-        traceback.print_exc()
-
-# ==============================================================================
-#  4. AGENTES
-# ==============================================================================
-def create_agents_and_tasks(user_query):
-    load_global_model()
+@spaces.GPU(duration=120)
+def chat_function(message, history):
+    if not message: return history
+    if history is None: history = []
     
-    llm = LocalQwen()
-    tools = [PDFRagTool()] if GLOBAL_VECTOR_DB else []
+    history.append([message, "🤖 Buscando no PDF (e Web se necessário)..."])
+    yield history
 
-    # Agente
-    analyst = Agent(
-        role="Analyst",
-        goal="Answer the question clearly.",
-        backstory="Expert Assistant.",
-        tools=tools,
-        llm=llm,
-        verbose=True,
-        allow_delegation=False,
-        cache=False,
-        max_iter=2
-    )
-
-    # Tarefa
-    task1 = Task(
-        description=f"User query: '{user_query}'. Use the SearchPDF tool if the query is about the document content. If not, answer directly. Be concise.",
-        expected_output="The final answer.",
-        agent=analyst
-    )
-
-    return Crew(
-        agents=[analyst],
-        tasks=[task1],
-        verbose=True,
-        process=Process.sequential,
-        memory=False, # Crucial para evitar uso de Embeddings OpenAI
-        cache=False,
-        manager_llm=None,
-        embedder={    
-             "provider": "huggingface",
-             "config": {"model": "sentence-transformers/all-MiniLM-L6-v2"}
-        }
-    )
+    try:
+        synthesizer, persona_prompt = get_multi_agent_system()
+        
+        full_instruction = f"{persona_prompt}\n\nUSER QUERY: {message}"
+        
+        response = synthesizer.run(full_instruction)
+        
+        history[-1] = [message, str(response)]
+        
+    except Exception as e:
+        error_msg = f"Erro na execução: {str(e)}"
+        print(error_msg)
+        history[-1] = [message, error_msg]
+    
+    yield history
 
 # ==============================================================================
-#  5. INTERFACE
+#  INTERFACE
 # ==============================================================================
 def process_pdf(file_obj):
     if not file_obj: return "Sem arquivo."
     try:
         path = file_obj.name if hasattr(file_obj, 'name') else file_obj
         if build_vector_store(path):
-            return "PDF Indexado! Qwen 7B Pronto."
+            return "PDF Indexado! Agentes com Web Search prontos."
         else:
-            return "Erro na indexação."
+            return "Erro ao indexar PDF."
     except Exception as e: return f"Erro: {e}"
 
-@spaces.GPU(duration=120)
-def chat_function(message, history):
-    if not message: return history
-    if history is None: history = []
-    
-    history.append([message, "🤖 Processando (Local Qwen)..."])
-    yield history
-
-    try:
-        crew = create_agents_and_tasks(message)
-        result = crew.kickoff()
-        history[-1] = [message, str(result.raw)]
-    except Exception as e:
-        msg = f"Erro: {str(e)}"
-        print(f"ERRO FINAL: {traceback.format_exc()}")
-        history[-1] = [message, msg]
-    
-    yield history
-
-with gr.Blocks(title="CrewAI Qwen Space") as demo:
-    gr.Markdown("# 🛡️ CrewAI Local no Hugging Face")
-    gr.Markdown("Powered by **Qwen 2.5 7B** (ZeroGPU)")
+with gr.Blocks(title="SmolAgents PDF+Web") as demo:
+    gr.Markdown("# 🧠 Multi-Agent RAG (PDF + Web)")
+    gr.Markdown("**Retriever** (Prioriza PDF, usa Web se falhar) ➡️ **Synthesizer** (Responde)")
     
     with gr.Row():
-        upl = gr.File(label="Upload PDF")
-        st = gr.Markdown("...")
-    chat = gr.Chatbot(height=550)
-    msg = gr.Textbox(label="Pergunta")
+        with gr.Column(scale=1):
+            upl = gr.File(label="Upload PDF")
+            status = gr.Markdown("Aguardando arquivo...")
+        
+        with gr.Column(scale=4):
+            chat = gr.Chatbot(height=600)
+            msg = gr.Textbox(label="Pergunta")
     
-    upl.change(process_pdf, upl, st)
+    upl.change(process_pdf, upl, status)
     msg.submit(chat_function, [msg, chat], [chat])
 
 if __name__ == "__main__":
