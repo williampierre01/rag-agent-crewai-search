@@ -242,11 +242,14 @@ def process_pdf(file_obj):
 
 with gr.Blocks(title="Multi-Agent Final Fix") as demo:
     gr.Markdown("# 🤖 Multi-Agent RAG (Qwen 7B Local)")
-        with gr.Row():
+    
+    with gr.Row():
         upl = gr.File(label="Upload PDF")
         st = gr.Markdown("...")
+    
     chat = gr.Chatbot(height=600)
     msg = gr.Textbox(label="Pergunta")
+    
     upl.change(process_pdf, upl, st)
     msg.submit(chat_function, [msg, chat], [chat])
 
