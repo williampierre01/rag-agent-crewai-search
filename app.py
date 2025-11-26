@@ -4,7 +4,7 @@ import spaces
 import torch
 import gc
 import traceback
-from smolagents import CodeAgent, Tool, TransformersModel
+from smolagents import CodeAgent, Tool, Model
 
 # Imports de RAG
 from langchain_community.document_loaders import PyPDFLoader
@@ -12,38 +12,80 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
-# Imports Transformers (Para criar o Pipeline Manual)
+# Imports Transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
 
 # ==============================================================================
 #  ESTADO GLOBAL
 # ==============================================================================
 GLOBAL_RETRIEVER = None
-GLOBAL_AGENT_MANAGER = None # Armazena o Agente Principal
+GLOBAL_ENGINE = None 
 
 # ==============================================================================
-#  1. CARREGAMENTO DO MODELO VIA PIPELINE (CORREÇÃO DEFINITIVA)
+#  1. ENGINE CUSTOMIZADA (CORREÇÃO FINAL)
 # ==============================================================================
-def load_model_engine():
+class LocalQwenEngine(Model):
     """
-    Cria um 'TransformersModel' usando um pipeline pré-carregado.
-    Isso evita erros de kwargs e erros de classe abstrata.
+    Uma classe controladora que recebe o pipeline e executa a geração,
+    filtrando quaisquer argumentos que o smolagents tente injetar incorretamente.
     """
+    def __init__(self, pipeline_obj):
+        super().__init__()
+        self.pipeline = pipeline_obj
+        self.tokenizer = pipeline_obj.tokenizer
+
+    def __call__(self, messages, stop_sequences=None, grammar=None, **kwargs):
+        """
+        Esta função é chamada pelo Agente quando ele quer que o LLM fale.
+        """
+        # 1. Limpeza de Argumentos (Onde o erro acontecia)
+        # Removemos 'pipeline', 'grammar' e qualquer outra coisa que o modelo não suporte.
+        clean_kwargs = {
+            k: v for k, v in kwargs.items() 
+            if k not in ['pipeline', 'grammar', 'stop_sequences', 'adapter_id']
+        }
+
+        # 2. Aplica o formato de Chat (System/User/Assistant)
+        # O Qwen precisa disso para entender quem está falando.
+        prompt = self.tokenizer.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+
+        # 3. Geração
+        outputs = self.pipeline(
+            prompt,
+            max_new_tokens=1024,
+            do_sample=True,
+            temperature=0.1,
+            top_p=0.95,
+            **clean_kwargs
+        )
+
+        # 4. Retorno do texto limpo
+        return outputs[0]["generated_text"]
+
+# ==============================================================================
+#  2. CARREGAMENTO (SETUP)
+# ==============================================================================
+def get_or_create_engine():
+    global GLOBAL_ENGINE
+    if GLOBAL_ENGINE is not None:
+        return GLOBAL_ENGINE
+
     print("--- CARREGANDO QWEN 2.5 (4-BIT) ---")
     
     model_id = "Qwen/Qwen2.5-7B-Instruct"
     
-    # Configuração de Memória
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    # Tokenizador
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     
-    # Modelo
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=bnb_config,
@@ -51,27 +93,25 @@ def load_model_engine():
         trust_remote_code=True
     )
 
-    # Pipeline (A Ponte Segura)
-    # Configuramos os parâmetros de geração AQUI para o smolagents usar
+    # O 'return_full_text=False' é crucial para não repetir o prompt na resposta
     text_pipeline = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=2048,
-        do_sample=True,
-        temperature=0.1,
-        top_p=0.95
+        return_full_text=False 
     )
 
-    # Criamos o Wrapper Oficial do Smolagents passando o pipeline
-    engine = TransformersModel(pipeline=text_pipeline)
+    # Instanciamos nossa classe manual em vez da TransformersModel bugada
+    GLOBAL_ENGINE = LocalQwenEngine(pipeline_obj=text_pipeline)
     
     print("--- ENGINE PRONTA ---")
-    return engine
+    return GLOBAL_ENGINE
 
 # ==============================================================================
-#  2. FERRAMENTA DE PDF
+#  3. FERRAMENTAS E AGENTES
 # ==============================================================================
+
+# Ferramenta de PDF
 class PDFSearchTool(Tool):
     name = "search_pdf"
     description = "Search for specific information within the uploaded PDF document."
@@ -83,25 +123,18 @@ class PDFSearchTool(Tool):
         if GLOBAL_RETRIEVER is None: return "Error: No PDF uploaded."
         try:
             docs = GLOBAL_RETRIEVER.invoke(query)
+            if not docs: return "No info found."
             return "\n\n".join([f"--- Content ---\n{doc.page_content}" for doc in docs])
         except Exception as e: return f"Error: {str(e)}"
 
-# ==============================================================================
-#  3. ADAPTADOR DE AGENTE (AGENT AS TOOL)
-# ==============================================================================
+# Classe para Agente como Ferramenta
 class AgentAsTool(Tool):
-    """
-    Permite que um Agente seja usado como ferramenta por outro Agente.
-    """
     def __init__(self, agent, name, description):
         self.agent = agent
         self.name = name
         self.description = description
         self.inputs = {
-            "task": {
-                "type": "string",
-                "description": "The question to ask this agent."
-            }
+            "task": {"type": "string", "description": "Question for the agent."}
         }
         self.output_type = "string"
         super().__init__()
@@ -110,57 +143,44 @@ class AgentAsTool(Tool):
         try:
             return str(self.agent.run(task))
         except Exception as e:
-            return f"Error from sub-agent: {str(e)}"
+            return f"Error: {str(e)}"
 
-# ==============================================================================
-#  4. SISTEMA MULTI-AGENTE (SETUP)
-# ==============================================================================
-def get_or_create_manager():
-    global GLOBAL_AGENT_MANAGER
-    
-    # Se já existe, retorna (Singleton)
-    if GLOBAL_AGENT_MANAGER is not None:
-        return GLOBAL_AGENT_MANAGER
+# Configuração Multi-Agente
+def get_manager_agent():
+    engine = get_or_create_engine()
 
-    # Carrega a Engine (Modelo)
-    model_engine = load_model_engine()
-
-    # --- AGENTE 1: PESQUISADOR (SUB-AGENTE) ---
+    # 1. Pesquisador
     researcher = CodeAgent(
         tools=[PDFSearchTool()],
-        model=model_engine,
+        model=engine,
         add_base_tools=False,
         name="pdf_researcher",
-        description="An expert analyst that reads PDFs."
+        description="Reads PDFs."
     )
 
-    # Transformamos em Ferramenta
+    # 2. Ferramenta de Pesquisa
     researcher_tool = AgentAsTool(
         agent=researcher,
         name="ask_researcher",
-        description="Use this tool to ask the Researcher to find facts in the PDF."
+        description="Ask the Researcher to find info in the PDF."
     )
 
-    # --- AGENTE 2: GERENTE (PRINCIPAL) ---
+    # 3. Gerente
     manager = CodeAgent(
         tools=[researcher_tool],
-        model=model_engine,
-        add_base_tools=False,
-        name="manager",
-        description="A manager that delegates tasks."
+        model=engine,
+        add_base_tools=False
     )
-    
-    GLOBAL_AGENT_MANAGER = manager
     return manager
 
 # ==============================================================================
-#  5. INDEXAÇÃO
+#  4. RAG E CHAT
 # ==============================================================================
 @spaces.GPU
 def build_vector_store(pdf_path):
     global GLOBAL_RETRIEVER
-    # Forçamos a criação do agente aqui para carregar o modelo na GPU logo no início
-    get_or_create_manager()
+    # Força carregamento do modelo agora
+    get_or_create_engine()
     
     print(f"[RAG] Indexando: {pdf_path}")
     try:
@@ -185,32 +205,24 @@ def build_vector_store(pdf_path):
         print(f"Erro: {e}")
         return False
 
-# ==============================================================================
-#  6. CHAT
-# ==============================================================================
 @spaces.GPU(duration=120)
 def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    history.append([message, "🤖 Gerente coordenando..."])
+    history.append([message, "🤖 Gerente processando..."])
     yield history
 
     try:
-        # Pega o gerente (já carregado)
-        manager = get_or_create_manager()
+        manager = get_manager_agent()
         
-        # Instrução clara para o modelo usar a ferramenta
         system_prompt = """
-        You are a Manager Agent.
-        If the user asks about the document, use the tool 'ask_researcher'.
-        If the user just says 'hi' or asks general questions, answer directly.
-        
-        User Query:
+        You are a Manager.
+        If the user asks about the PDF, use 'ask_researcher'.
+        If the user greets you, answer directly.
         """
         
-        # Executa
-        response = manager.run(f"{system_prompt} {message}")
+        response = manager.run(f"{system_prompt}\nUser: {message}")
         history[-1] = [message, str(response)]
         
     except Exception as e:
@@ -228,10 +240,9 @@ def process_pdf(file_obj):
         return "PDF Pronto! Agentes Ativos."
     return "Erro ao indexar."
 
-with gr.Blocks(title="Multi-Agent Pipeline Fix") as demo:
-    gr.Markdown("# 🤖 Multi-Agent RAG (Pipeline Fix)")
-    gr.Markdown("Usando **Qwen 2.5 7B** via Pipeline para máxima compatibilidade.")
-    with gr.Row():
+with gr.Blocks(title="Multi-Agent Final Fix") as demo:
+    gr.Markdown("# 🤖 Multi-Agent RAG (Qwen 7B Local)")
+        with gr.Row():
         upl = gr.File(label="Upload PDF")
         st = gr.Markdown("...")
     chat = gr.Chatbot(height=600)
