@@ -12,7 +12,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
-# Imports Transformers (Carregamento Seguro)
+# Imports Transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # ==============================================================================
@@ -22,7 +22,7 @@ GLOBAL_RETRIEVER = None
 GLOBAL_ENGINE = None 
 
 # ==============================================================================
-#  1. ENGINE CUSTOMIZADA (CORREÇÃO DO ERRO 'load_in_4bit')
+#  1. ENGINE CUSTOMIZADA (CORREÇÃO DO ERRO DE IMPLEMENTAÇÃO)
 # ==============================================================================
 class LocalQwenEngine(Model):
     def __init__(self, model_id="Qwen/Qwen2.5-7B-Instruct"):
@@ -51,7 +51,8 @@ class LocalQwenEngine(Model):
         )
         print("--- MODELO CARREGADO ---")
 
-    def __call__(self, messages, stop_sequences=None, **kwargs):
+    # --- CORREÇÃO AQUI: Adicionado 'grammar' e assinatura genérica ---
+    def __call__(self, messages, stop_sequences=None, grammar=None, **kwargs):
         self.load()
         
         # Template de Chat
@@ -63,9 +64,11 @@ class LocalQwenEngine(Model):
         
         model_inputs = self.tokenizer([text_prompt], return_tensors="pt").to(self.model.device)
         
-        # Limpeza de kwargs (Remove argumentos que causam erro)
+        # Limpeza de kwargs (Remove argumentos que o modelo não aceita)
+        # Removemos 'grammar' pois o Qwen HF Pipeline não suporta nativamente ainda
         clean_kwargs = {k: v for k, v in kwargs.items() if k not in ['load_in_4bit', 'adapter_id']}
         
+        # Gerar
         generated_ids = self.model.generate(
             **model_inputs,
             max_new_tokens=1024,
@@ -74,19 +77,16 @@ class LocalQwenEngine(Model):
             **clean_kwargs
         )
         
+        # Decodificar apenas a resposta
         generated_ids = [
             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
         ]
         return self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
 # ==============================================================================
-#  2. ADAPTADOR DE AGENTE (CORREÇÃO DO ERRO 'ManagedAgent')
+#  2. ADAPTADOR DE AGENTE (AgentAsTool)
 # ==============================================================================
 class AgentAsTool(Tool):
-    """
-    Esta classe substitui o ManagedAgent. Ela transforma um Agente inteiro
-    em uma ferramenta simples que outro agente pode chamar.
-    """
     def __init__(self, agent, name, description):
         self.agent = agent
         self.name = name
@@ -102,7 +102,6 @@ class AgentAsTool(Tool):
 
     def forward(self, task: str) -> str:
         try:
-            # O agente executa a tarefa e retorna a resposta como string
             return str(self.agent.run(task))
         except Exception as e:
             return f"Error from sub-agent: {str(e)}"
@@ -121,6 +120,7 @@ class PDFSearchTool(Tool):
         if GLOBAL_RETRIEVER is None: return "Error: No PDF uploaded."
         try:
             docs = GLOBAL_RETRIEVER.invoke(query)
+            if not docs: return "No info found."
             return "\n\n".join([f"--- Content ---\n{doc.page_content}" for doc in docs])
         except Exception as e: return f"Error: {str(e)}"
 
@@ -134,7 +134,7 @@ def get_multi_agent_system():
         GLOBAL_ENGINE = LocalQwenEngine()
     GLOBAL_ENGINE.load()
 
-    # 2. Agente Pesquisador (Sub-Agente)
+    # 2. Agente Pesquisador
     retriever = CodeAgent(
         tools=[PDFSearchTool()],
         model=GLOBAL_ENGINE,
@@ -142,16 +142,16 @@ def get_multi_agent_system():
         description="Expert analyst that reads PDFs."
     )
 
-    # 3. Cria a "Ferramenta" que chama o Pesquisador
+    # 3. Ferramenta para chamar o Pesquisador
     researcher_tool = AgentAsTool(
         agent=retriever,
         name="ask_researcher",
         description="Use this tool to ask the Researcher Agent to find information in the PDF."
     )
 
-    # 4. Agente Gerente (Principal)
+    # 4. Agente Gerente
     manager = CodeAgent(
-        tools=[researcher_tool], # O gerente só vê a ferramenta, não o agente
+        tools=[researcher_tool],
         model=GLOBAL_ENGINE,
         add_base_tools=False
     )
@@ -192,19 +192,21 @@ def build_vector_store(pdf_path):
 def chat_function(message, history):
     if not message: return history
     if history is None: history = []
-    history.append([message, "🤖 Gerente consultando Pesquisador..."])
+    history.append([message, "🤖 Gerente coordenando Agentes..."])
     yield history
 
     try:
         manager = get_multi_agent_system()
         
-        # Prompt para guiar o gerente a usar a ferramenta correta
-        system_prompt = "You are a Manager. If the user asks about the document, use 'ask_researcher'. If not, answer directly."
+        # Prompt do sistema
+        system_prompt = "You are a Manager. Use 'ask_researcher' to find info in the PDF. Answer the user clearly."
         
-        response = manager.run(f"{system_prompt} User Query: {message}")
+        response = manager.run(f"{system_prompt}\nUser Query: {message}")
         history[-1] = [message, str(response)]
     except Exception as e:
-        history[-1] = [message, f"Erro: {str(e)}"]
+        error_msg = f"Erro: {str(e)}"
+        print(traceback.format_exc()) # Imprime erro detalhado no log
+        history[-1] = [message, error_msg]
     
     yield history
 
@@ -217,7 +219,7 @@ def process_pdf(file_obj):
         return "PDF Pronto! Sistema Multi-Agente Ativo."
     return "Erro ao indexar."
 
-with gr.Blocks(title="Multi-Agent Final") as demo:
+with gr.Blocks(title="Final Multi-Agent") as demo:
     gr.Markdown("# 🤖 Multi-Agent RAG (Qwen 7B Local)")
     with gr.Row():
         upl = gr.File(label="Upload PDF")
