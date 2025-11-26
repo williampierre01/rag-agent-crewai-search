@@ -3,7 +3,7 @@ import os
 import spaces
 import torch
 import gc
-from smolagents import CodeAgent, TransformersModel, Tool, ManagedAgent, DuckDuckGoSearchTool
+from smolagents import CodeAgent, TransformersModel, Tool, DuckDuckGoSearchTool
 
 # Imports de RAG
 from langchain_community.document_loaders import PyPDFLoader
@@ -45,7 +45,7 @@ class PDFSearchTool(Tool):
             return f"Error searching PDF: {str(e)}"
 
 # ==============================================================================
-#  2. CARREGAMENTO DO MODELO (SINGLETON)
+#  2. CARREGAMENTO DO MODELO
 # ==============================================================================
 def load_model():
     global GLOBAL_MODEL
@@ -63,63 +63,74 @@ def load_model():
     return GLOBAL_MODEL
 
 # ==============================================================================
-#  3. CRIAÇÃO DOS AGENTES (PDF + WEB)
+#  3. AGENTES (SOLUÇÃO SEM ManagedAgent)
 # ==============================================================================
+
+# --- CLASSE ESPECIAL: AGENTE COMO FERRAMENTA ---
+# Isso substitui o ManagedAgent. Envolvemos um agente dentro de uma Tool.
+class AgentAsTool(Tool):
+    def __init__(self, agent, name, description):
+        self.agent = agent
+        self.name = name
+        self.description = description
+        self.inputs = {
+            "task": {
+                "type": "string",
+                "description": "The task or question to delegate to this agent."
+            }
+        }
+        self.output_type = "string"
+        super().__init__()
+
+    def forward(self, task: str) -> str:
+        try:
+            return str(self.agent.run(task))
+        except Exception as e:
+            return f"Error from sub-agent: {str(e)}"
+
 def get_multi_agent_system():
     model = load_model()
 
-    # --- INSTANCIAR FERRAMENTAS ---
-    pdf_tool = PDFSearchTool()
-    web_tool = DuckDuckGoSearchTool() # Ferramenta de Busca Web Gratuita
-
-    # --- AGENTE 1: RETRIEVER AGENT ---
-    # Agora ele tem DUAS ferramentas: PDF e Web.
+    # 1. Agente Pesquisador (PDF + Web)
     retriever = CodeAgent(
-        tools=[pdf_tool, web_tool],
+        tools=[PDFSearchTool(), DuckDuckGoSearchTool()],
         model=model,
-        name="retriever_agent",
-        description="""You are a meticulous analyst. 
-        Your goal is to retrieve the most relevant information.
-        IMPORTANT:
-        1. ALWAYS try to use the 'search_pdf' tool FIRST.
-        2. ONLY if the PDF tool returns no results or insufficient info, then use the 'web_search' tool.
-        """,
-        add_base_tools=False
+        add_base_tools=False,
+        description="A meticulous analyst that searches PDF and Web."
     )
 
-    managed_retriever = ManagedAgent(
+    # 2. Transformamos o Pesquisador em uma Ferramenta
+    # Assim o Gerente pode "usá-lo" como se fosse uma calculadora ou busca.
+    researcher_tool = AgentAsTool(
         agent=retriever,
-        name="retriever_agent",
-        description="Call this agent to retrieve information. It can check the PDF and the Web."
+        name="ask_researcher",
+        description="Use this tool to ask the Researcher Agent to find information. Give it a detailed question."
     )
 
-    # --- AGENTE 2: RESPONSE SYNTHESIZER (MANAGER) ---
-    system_prompt_synthesizer = """
-    You are the 'response_synthesizer_agent'.
+    # 3. Agente Gerente (Synthesizer)
+    # Ele recebe a ferramenta 'ask_researcher'
     
-    BACKSTORY:
-    You're a skilled communicator with a knack for turning complex information into clear and concise responses.
+    system_prompt = """
+    You are a Senior Response Synthesizer.
+    Your goal is to answer the user's question clearly.
     
-    GOAL:
-    Synthesize the retrieved information into a concise and coherent response based on the user query.
+    You have a powerful tool called 'ask_researcher'.
+    ALWAYS delegate the research to 'ask_researcher' first.
     
-    INSTRUCTIONS:
-    1. Delegate the research to 'retriever_agent'.
-    2. If the retriever finds information (from PDF or Web), summarize it clearly.
-    3. If the retriever fails completely (nothing in PDF and nothing on Web), respond with: "I'm sorry, I couldn't find the information you're looking for."
+    If the researcher returns information, summarize it nicely.
+    If the researcher fails, apologize.
     """
-
-    synthesizer_agent = CodeAgent(
-        tools=[], 
-        managed_agents=[managed_retriever],
+    
+    manager = CodeAgent(
+        tools=[researcher_tool], # O agente virou ferramenta aqui
         model=model,
         add_base_tools=False
     )
     
-    return synthesizer_agent, system_prompt_synthesizer
+    return manager, system_prompt
 
 # ==============================================================================
-#  4. INDEXAÇÃO (RAG)
+#  4. INDEXAÇÃO
 # ==============================================================================
 @spaces.GPU
 def build_vector_store(pdf_path):
@@ -160,15 +171,15 @@ def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    history.append([message, "🤖 Buscando no PDF (e Web se necessário)..."])
+    history.append([message, "🤖 Gerente delegando para Pesquisador..."])
     yield history
 
     try:
-        synthesizer, persona_prompt = get_multi_agent_system()
+        manager, prompt = get_multi_agent_system()
         
-        full_instruction = f"{persona_prompt}\n\nUSER QUERY: {message}"
+        full_msg = f"{prompt}\n\nUSER QUESTION: {message}"
         
-        response = synthesizer.run(full_instruction)
+        response = manager.run(full_msg)
         
         history[-1] = [message, str(response)]
         
@@ -187,14 +198,14 @@ def process_pdf(file_obj):
     try:
         path = file_obj.name if hasattr(file_obj, 'name') else file_obj
         if build_vector_store(path):
-            return "PDF Indexado! Agentes com Web Search prontos."
+            return "PDF Indexado! Agentes Prontos."
         else:
             return "Erro ao indexar PDF."
     except Exception as e: return f"Erro: {e}"
 
-with gr.Blocks(title="SmolAgents PDF+Web") as demo:
-    gr.Markdown("# 🧠 Multi-Agent RAG (PDF + Web)")
-    gr.Markdown("**Retriever** (Prioriza PDF, usa Web se falhar) ➡️ **Synthesizer** (Responde)")
+with gr.Blocks(title="SmolAgents Multi v2") as demo:
+    gr.Markdown("# 🧠 Multi-Agent RAG (Stable Version)")
+    gr.Markdown("Manager ➡️ Researcher (PDF + Web)")
     
     with gr.Row():
         with gr.Column(scale=1):
