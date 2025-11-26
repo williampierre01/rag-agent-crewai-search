@@ -1,30 +1,47 @@
-import gradio as gr
 import os
+
+# ==============================================================================
+#  CONFIGURAÇÕES DE AMBIENTE (DEVEM FICAR NO TOPO ABSOLUTO)
+# ==============================================================================
+# Definimos isso ANTES de importar qualquer biblioteca para garantir que
+# o CrewAI/LiteLLM carreguem essas configurações ao iniciar.
+
+# 1. Chave Falsa (mas com formato que engana validadores regex)
+os.environ["OPENAI_API_KEY"] = "sk-proj-fake-key-for-local-execution-12345"
+
+# 2. Redirecionamento para "Buraco Negro" Local
+# Dizemos que a API da OpenAI está no próprio container (onde não tem nada).
+# Assim, qualquer tentativa de conexão morre instantaneamente sem sair para a internet (evitando erro 401).
+os.environ["OPENAI_API_BASE"] = "http://127.0.0.1:11434/v1"
+
+# 3. Desativar Monitoramento e Telemetria (Evita conexões externas)
+os.environ["OTEL_SDK_DISABLED"] = "true"
+os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
+os.environ["SCARF_NO_ANALYTICS"] = "true"
+
+# ==============================================================================
+#  IMPORTS (SÓ AGORA IMPORTAMOS O RESTO)
+# ==============================================================================
+import gradio as gr
 import spaces
 import traceback
 import gc
-from typing import Any, List, Optional, Dict
+from typing import Any, List, Optional
 from crewai import Agent, Crew, Process, Task
 from crewai.tools import BaseTool
 
-# LangChain Imports
+# LangChain
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.language_models.llms import LLM
 from langchain_core.callbacks.manager import CallbackManagerForLLMRun
-from pydantic import PrivateAttr, Field
+from pydantic import PrivateAttr
 
-# Transformers Imports
+# Transformers
 from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
-
-# ==============================================================================
-#  CONFIGURAÇÕES
-# ==============================================================================
-os.environ["OPENAI_API_KEY"] = "NA"
-os.environ["OTEL_SDK_DISABLED"] = "true"
 
 # ==============================================================================
 #  GLOBAL STATE
@@ -33,7 +50,7 @@ GLOBAL_VECTOR_DB = None
 GLOBAL_PIPELINE = None 
 
 # ==============================================================================
-#  1. RAG (BANCO VETORIAL)
+#  1. BANCO VETORIAL (RAG)
 # ==============================================================================
 @spaces.GPU
 def build_vector_store(pdf_path):
@@ -47,6 +64,7 @@ def build_vector_store(pdf_path):
         loader = PyPDFLoader(pdf_path)
         docs = loader.load()
         
+        # Chunks médios para balancear contexto e memória
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
         splits = text_splitter.split_documents(docs)
 
@@ -59,7 +77,7 @@ def build_vector_store(pdf_path):
             persist_directory=None
         )
         
-        GLOBAL_VECTOR_DB = vectorstore.as_retriever(search_kwargs={"k": 2})
+        GLOBAL_VECTOR_DB = vectorstore.as_retriever(search_kwargs={"k": 3})
         return True
     except Exception as e:
         print(f"[ERRO RAG] {e}")
@@ -81,14 +99,15 @@ class PDFRagTool(BaseTool):
         except: return "No info found."
 
 # ==============================================================================
-#  3. LLM CUSTOMIZADO (O "CAVALO DE TROIA")
+#  3. LLM CUSTOMIZADO (LOCAL QWEN)
 # ==============================================================================
 class LocalQwen(LLM):
     """
-    Enganamos o CrewAI com o nome 'gpt-3.5-turbo' para passar na validação do LiteLLM,
-    mas executamos o código localmente na GPU com o pipeline do HuggingFace.
+    LLM Local usando Qwen 2.5 7B.
+    Finge ser 'gpt-3.5-turbo' para passar nas validações do CrewAI,
+    mas roda localmente no Pipeline do HuggingFace.
     """
-    model_name: str = "gpt-3.5-turbo" # <--- O TRUQUE ESTÁ AQUI (Nome falso para passar validação)
+    model_name: str = "gpt-3.5-turbo" 
     _is_dummy: bool = PrivateAttr(default=True)
 
     def _call(
@@ -104,8 +123,10 @@ class LocalQwen(LLM):
             return "SYSTEM_ERROR: O modelo Qwen não está carregado na memória."
 
         try:
-            # --- LIMPEZA DE ARGUMENTOS ---
-            clean_kwargs = {
+            # 1. Limpeza de Argumentos
+            # O CrewAI tenta passar callbacks e stops que o pipeline não aceita.
+            # Filtramos apenas os parâmetros de geração seguros.
+            gen_config = {
                 "max_new_tokens": 1024,
                 "return_full_text": False,
                 "do_sample": True,
@@ -113,13 +134,15 @@ class LocalQwen(LLM):
                 "repetition_penalty": 1.1
             }
 
-            # Formatação do Prompt (Qwen ChatML)
+            # 2. Formatação do Prompt (ChatML)
             formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
             
-            # Chamada Real ao Modelo Local
-            response = GLOBAL_PIPELINE(formatted_prompt, **clean_kwargs)
+            # 3. Execução
+            response = GLOBAL_PIPELINE(formatted_prompt, **gen_config)
             
             generated_text = response[0]['generated_text']
+            
+            # 4. Limpeza da Resposta
             generated_text = generated_text.replace("<|im_end|>", "").strip()
             
             if not generated_text:
@@ -128,8 +151,9 @@ class LocalQwen(LLM):
             return generated_text
 
         except Exception as e:
-            print(f"\n!!! ERRO INTERNO !!!\n{traceback.format_exc()}")
-            return f"Note: Internal error ({str(e)}). Continuing..."
+            # Captura erros internos (memória, cuda) e retorna como texto
+            print(f"\n!!! ERRO INTERNO NO LLM !!!\n{traceback.format_exc()}")
+            return f"Note: I encountered an internal error ({str(e)}). I will proceed with available information."
 
     @property
     def _llm_type(self) -> str:
@@ -142,7 +166,7 @@ def load_global_model():
     global GLOBAL_PIPELINE
     if GLOBAL_PIPELINE is not None: return
 
-    print("--- LOAD QWEN 7B ---")
+    print("--- CARREGANDO QWEN 7B (4-BIT) ---")
     try:
         model_name = "Qwen/Qwen2.5-7B-Instruct"
         
@@ -166,9 +190,9 @@ def load_global_model():
             model=model,
             tokenizer=tokenizer
         )
-        print("--- QWEN READY ---")
+        print("--- QWEN PRONTO ---")
     except Exception as e:
-        print(f"FATAL ERROR: {e}")
+        print(f"ERRO AO CARREGAR MODELO: {e}")
         traceback.print_exc()
 
 # ==============================================================================
@@ -180,22 +204,23 @@ def create_agents_and_tasks(user_query):
     llm = LocalQwen()
     tools = [PDFRagTool()] if GLOBAL_VECTOR_DB else []
 
-    # Agente Único para máxima estabilidade
+    # Agente
     analyst = Agent(
         role="Analyst",
-        goal="Answer the question.",
-        backstory="Helpful assistant.",
+        goal="Answer the question clearly.",
+        backstory="Expert Assistant.",
         tools=tools,
         llm=llm,
         verbose=True,
         allow_delegation=False,
         cache=False,
-        max_iter=1
+        max_iter=2
     )
 
+    # Tarefa
     task1 = Task(
-        description=f"User: '{user_query}'. Use SearchPDF if needed. Answer clearly.",
-        expected_output="The answer.",
+        description=f"User query: '{user_query}'. Use the SearchPDF tool if the query is about the document content. If not, answer directly. Be concise.",
+        expected_output="The final answer.",
         agent=analyst
     )
 
@@ -204,7 +229,7 @@ def create_agents_and_tasks(user_query):
         tasks=[task1],
         verbose=True,
         process=Process.sequential,
-        memory=False, 
+        memory=False, # Crucial para evitar uso de Embeddings OpenAI
         cache=False,
         manager_llm=None,
         embedder={    
@@ -231,7 +256,7 @@ def chat_function(message, history):
     if not message: return history
     if history is None: history = []
     
-    history.append([message, "🤖 Processando..."])
+    history.append([message, "🤖 Processando (Local Qwen)..."])
     yield history
 
     try:
@@ -245,8 +270,9 @@ def chat_function(message, history):
     
     yield history
 
-with gr.Blocks(title="Qwen Trojan Fix") as demo:
-    gr.Markdown("# 🛡️ CrewAI + Qwen (Correção de Provedor)")
+with gr.Blocks(title="CrewAI Qwen Space") as demo:
+    gr.Markdown("# 🛡️ CrewAI Local no Hugging Face")
+    gr.Markdown("Powered by **Qwen 2.5 7B** (ZeroGPU)")
     
     with gr.Row():
         upl = gr.File(label="Upload PDF")
