@@ -4,7 +4,7 @@ import spaces
 import torch
 import gc
 import traceback
-from smolagents import CodeAgent, Tool, Model
+from smolagents import CodeAgent, Tool, Model, ChatMessage
 
 # Imports de RAG
 from langchain_community.document_loaders import PyPDFLoader
@@ -22,46 +22,75 @@ GLOBAL_RETRIEVER = None
 GLOBAL_ENGINE = None 
 
 # ==============================================================================
-#  1. ENGINE CUSTOMIZADA (CORREÇÃO DA PROPRIEDADE TOKENIZER)
+#  1. ENGINE CUSTOMIZADA (A CORREÇÃO FINAL)
 # ==============================================================================
 class LocalQwenEngine(Model):
+    """
+    Implementação completa da classe Model do smolagents.
+    Sobrescrevemos 'generate' para evitar erros de método abstrato.
+    """
     def __init__(self, pipeline_obj):
         super().__init__()
         self.pipeline = pipeline_obj
-        self._tokenizer = pipeline_obj.tokenizer
+        self.tokenizer = pipeline_obj.tokenizer
 
-    # --- CORREÇÃO AQUI: Usar @property ---
-    # A biblioteca smolagents acessa 'model.tokenizer', não 'model.get_tokenizer()'
-    @property
-    def tokenizer(self):
-        return self._tokenizer
+    def get_tokenizer(self):
+        return self.tokenizer
 
-    def __call__(self, messages, stop_sequences=None, grammar=None, **kwargs):
+    # --- O PULO DO GATO: Sobrescrever 'generate' ---
+    def generate(self, messages, stop_sequences=None, grammar=None, **kwargs):
+        """
+        Este é o método principal que o smolagents chama.
+        Nós tratamos tudo manualmente aqui dentro.
+        """
         # 1. Limpeza de Argumentos
+        # Removemos qualquer coisa que o pipeline do HF não suporte
         clean_kwargs = {
             k: v for k, v in kwargs.items() 
             if k not in ['pipeline', 'grammar', 'stop_sequences', 'adapter_id']
         }
 
-        # 2. Formatação do Chat
-        prompt = self._tokenizer.apply_chat_template(
-            messages, 
+        # 2. Conversão de Mensagens (Smolagents usa objetos ChatMessage)
+        # Precisamos converter para lista de dicts que o tokenizer entende
+        formatted_messages = []
+        for msg in messages:
+            # Se for dicionário, usa direto. Se for objeto ChatMessage, converte.
+            if isinstance(msg, dict):
+                formatted_messages.append(msg)
+            elif hasattr(msg, 'role') and hasattr(msg, 'content'):
+                formatted_messages.append({"role": msg.role, "content": msg.content})
+            else:
+                # Fallback para string
+                formatted_messages.append({"role": "user", "content": str(msg)})
+
+        # 3. Aplica o template de chat
+        prompt = self.tokenizer.apply_chat_template(
+            formatted_messages, 
             tokenize=False, 
             add_generation_prompt=True
         )
 
-        # 3. Geração
-        outputs = self.pipeline(
-            prompt,
-            max_new_tokens=2048,
-            do_sample=True,
-            temperature=0.1,
-            top_p=0.95,
-            **clean_kwargs
-        )
-
-        # 4. Retorno do texto
-        return outputs[0]["generated_text"]
+        # 4. Geração
+        try:
+            outputs = self.pipeline(
+                prompt,
+                max_new_tokens=2048,
+                do_sample=True,
+                temperature=0.1,
+                top_p=0.95,
+                **clean_kwargs
+            )
+            
+            # Retorna um objeto ChatMessage como o smolagents espera
+            response_text = outputs[0]["generated_text"]
+            
+            # O smolagents espera um objeto ChatMessage no retorno
+            return ChatMessage(role="assistant", content=response_text)
+            
+        except Exception as e:
+            print(f"Erro na geração: {e}")
+            # Retorna mensagem de erro formatada para não quebrar o fluxo
+            return ChatMessage(role="assistant", content=f"Error generating response: {str(e)}")
 
 # ==============================================================================
 #  2. CARREGAMENTO (SETUP)
@@ -154,7 +183,7 @@ def get_manager_agent():
     researcher_tool = AgentAsTool(
         agent=researcher,
         name="ask_researcher",
-        description="Ask the Researcher to find info in the PDF."
+        description="Use this to ask the Researcher to find info in the PDF."
     )
 
     # 3. Gerente
