@@ -4,7 +4,7 @@ import spaces
 import torch
 import gc
 import traceback
-from smolagents import CodeAgent, Tool, TransformersModel
+from smolagents import CodeAgent, Tool, Model
 
 # Imports de RAG
 from langchain_community.document_loaders import PyPDFLoader
@@ -12,7 +12,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
-# Imports Transformers (Para criar o Pipeline Manualmente)
+# Imports Transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
 
 # ==============================================================================
@@ -22,7 +22,53 @@ GLOBAL_RETRIEVER = None
 GLOBAL_ENGINE = None 
 
 # ==============================================================================
-#  1. ENGINE OFICIAL COM PIPELINE INJETADO (A SOLUÇÃO)
+#  1. ENGINE CUSTOMIZADA (CORREÇÃO TOTAL)
+# ==============================================================================
+class LocalQwenEngine(Model):
+    """
+    Esta classe corrige TODOS os erros anteriores:
+    1. Implementa get_tokenizer (corrige erro de child class).
+    2. Filtra kwargs (corrige erro de 'pipeline' argument).
+    """
+    def __init__(self, pipeline_obj):
+        super().__init__()
+        self.pipeline = pipeline_obj
+        self.tokenizer_obj = pipeline_obj.tokenizer
+
+    # --- OBRIGATÓRIO NA NOVA VERSÃO DO SMOLAGENTS ---
+    def get_tokenizer(self):
+        return self.tokenizer_obj
+
+    def __call__(self, messages, stop_sequences=None, grammar=None, **kwargs):
+        # 1. Limpeza de Argumentos
+        # Removemos 'pipeline', 'grammar' e qualquer lixo que cause erro na geração
+        clean_kwargs = {
+            k: v for k, v in kwargs.items() 
+            if k not in ['pipeline', 'grammar', 'stop_sequences', 'adapter_id']
+        }
+
+        # 2. Formatação do Chat
+        prompt = self.tokenizer_obj.apply_chat_template(
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+
+        # 3. Geração
+        outputs = self.pipeline(
+            prompt,
+            max_new_tokens=2048,
+            do_sample=True,
+            temperature=0.1,
+            top_p=0.95,
+            **clean_kwargs
+        )
+
+        # 4. Retorno do texto limpo
+        return outputs[0]["generated_text"]
+
+# ==============================================================================
+#  2. CARREGAMENTO (SETUP)
 # ==============================================================================
 def get_or_create_engine():
     global GLOBAL_ENGINE
@@ -33,17 +79,14 @@ def get_or_create_engine():
     
     model_id = "Qwen/Qwen2.5-7B-Instruct"
     
-    # 1. Configuração de Memória (4-bit)
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    # 2. Tokenizador
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     
-    # 3. Modelo
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=bnb_config,
@@ -51,32 +94,24 @@ def get_or_create_engine():
         trust_remote_code=True
     )
 
-    # 4. Pipeline (A Ponte Segura)
-    # Configuramos aqui para não dar erro de kwargs depois
+    # return_full_text=False é crucial para o agente não ficar repetindo a pergunta
     text_pipeline = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=2048,
-        do_sample=True,
-        temperature=0.1,
-        top_p=0.95,
-        return_full_text=False # Importante para agentes não repetirem o prompt
+        return_full_text=False 
     )
 
-    # 5. Injeção no Wrapper Oficial
-    # Passamos o pipeline PRONTO. O smolagents usa ele sem tentar recarregar nada.
-    # Isso evita o erro "method must be implemented" pois usamos a classe oficial.
-    GLOBAL_ENGINE = TransformersModel(pipeline=text_pipeline)
+    # Instanciamos nossa classe MANUAL, não a oficial bugada
+    GLOBAL_ENGINE = LocalQwenEngine(pipeline_obj=text_pipeline)
     
     print("--- ENGINE PRONTA ---")
     return GLOBAL_ENGINE
 
 # ==============================================================================
-#  2. FERRAMENTAS E ADAPTADORES
+#  3. FERRAMENTAS E AGENTES
 # ==============================================================================
 
-# Ferramenta de PDF
 class PDFSearchTool(Tool):
     name = "search_pdf"
     description = "Search for specific information within the uploaded PDF document."
@@ -92,15 +127,14 @@ class PDFSearchTool(Tool):
             return "\n\n".join([f"--- Content ---\n{doc.page_content}" for doc in docs])
         except Exception as e: return f"Error: {str(e)}"
 
-# Classe para Agente como Ferramenta (Manual ManagedAgent)
-# Mantemos essa classe manual para evitar erro de importação da versão beta
+# Agente como Ferramenta (Substitui ManagedAgent que estava faltando)
 class AgentAsTool(Tool):
     def __init__(self, agent, name, description):
         self.agent = agent
         self.name = name
         self.description = description
         self.inputs = {
-            "task": {"type": "string", "description": "The question for the agent."}
+            "task": {"type": "string", "description": "The task for the agent."}
         }
         self.output_type = "string"
         super().__init__()
@@ -111,14 +145,10 @@ class AgentAsTool(Tool):
         except Exception as e:
             return f"Error: {str(e)}"
 
-# ==============================================================================
-#  3. SISTEMA MULTI-AGENTE
-# ==============================================================================
 def get_manager_agent():
-    # Garante que a engine existe
     engine = get_or_create_engine()
 
-    # 1. Agente Pesquisador (Sub-Agente)
+    # 1. Pesquisador
     researcher = CodeAgent(
         tools=[PDFSearchTool()],
         model=engine,
@@ -131,10 +161,10 @@ def get_manager_agent():
     researcher_tool = AgentAsTool(
         agent=researcher,
         name="ask_researcher",
-        description="Ask the Researcher to find info in the PDF."
+        description="Use this to ask the Researcher to find info in the PDF."
     )
 
-    # 3. Agente Gerente (Principal)
+    # 3. Gerente
     manager = CodeAgent(
         tools=[researcher_tool],
         model=engine,
@@ -148,8 +178,7 @@ def get_manager_agent():
 @spaces.GPU
 def build_vector_store(pdf_path):
     global GLOBAL_RETRIEVER
-    # Força carregamento do modelo agora
-    get_or_create_engine()
+    get_or_create_engine() 
     
     print(f"[RAG] Indexando: {pdf_path}")
     try:
