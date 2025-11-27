@@ -22,33 +22,29 @@ GLOBAL_RETRIEVER = None
 GLOBAL_ENGINE = None 
 
 # ==============================================================================
-#  1. ENGINE CUSTOMIZADA (CORREÇÃO TOTAL)
+#  1. ENGINE CUSTOMIZADA (CORREÇÃO DA PROPRIEDADE TOKENIZER)
 # ==============================================================================
 class LocalQwenEngine(Model):
-    """
-    Esta classe corrige TODOS os erros anteriores:
-    1. Implementa get_tokenizer (corrige erro de child class).
-    2. Filtra kwargs (corrige erro de 'pipeline' argument).
-    """
     def __init__(self, pipeline_obj):
         super().__init__()
         self.pipeline = pipeline_obj
-        self.tokenizer_obj = pipeline_obj.tokenizer
+        self._tokenizer = pipeline_obj.tokenizer
 
-    # --- OBRIGATÓRIO NA NOVA VERSÃO DO SMOLAGENTS ---
-    def get_tokenizer(self):
-        return self.tokenizer_obj
+    # --- CORREÇÃO AQUI: Usar @property ---
+    # A biblioteca smolagents acessa 'model.tokenizer', não 'model.get_tokenizer()'
+    @property
+    def tokenizer(self):
+        return self._tokenizer
 
     def __call__(self, messages, stop_sequences=None, grammar=None, **kwargs):
         # 1. Limpeza de Argumentos
-        # Removemos 'pipeline', 'grammar' e qualquer lixo que cause erro na geração
         clean_kwargs = {
             k: v for k, v in kwargs.items() 
             if k not in ['pipeline', 'grammar', 'stop_sequences', 'adapter_id']
         }
 
         # 2. Formatação do Chat
-        prompt = self.tokenizer_obj.apply_chat_template(
+        prompt = self._tokenizer.apply_chat_template(
             messages, 
             tokenize=False, 
             add_generation_prompt=True
@@ -64,7 +60,7 @@ class LocalQwenEngine(Model):
             **clean_kwargs
         )
 
-        # 4. Retorno do texto limpo
+        # 4. Retorno do texto
         return outputs[0]["generated_text"]
 
 # ==============================================================================
@@ -94,7 +90,6 @@ def get_or_create_engine():
         trust_remote_code=True
     )
 
-    # return_full_text=False é crucial para o agente não ficar repetindo a pergunta
     text_pipeline = pipeline(
         "text-generation",
         model=model,
@@ -102,7 +97,6 @@ def get_or_create_engine():
         return_full_text=False 
     )
 
-    # Instanciamos nossa classe MANUAL, não a oficial bugada
     GLOBAL_ENGINE = LocalQwenEngine(pipeline_obj=text_pipeline)
     
     print("--- ENGINE PRONTA ---")
@@ -127,7 +121,6 @@ class PDFSearchTool(Tool):
             return "\n\n".join([f"--- Content ---\n{doc.page_content}" for doc in docs])
         except Exception as e: return f"Error: {str(e)}"
 
-# Agente como Ferramenta (Substitui ManagedAgent que estava faltando)
 class AgentAsTool(Tool):
     def __init__(self, agent, name, description):
         self.agent = agent
@@ -161,7 +154,7 @@ def get_manager_agent():
     researcher_tool = AgentAsTool(
         agent=researcher,
         name="ask_researcher",
-        description="Use this to ask the Researcher to find info in the PDF."
+        description="Ask the Researcher to find info in the PDF."
     )
 
     # 3. Gerente
