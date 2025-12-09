@@ -1,5 +1,5 @@
 ---
-title: AI_Agent_Rag
+title: Agent_RAG
 emoji: 🤖
 colorFrom: blue
 colorTo: yellow
