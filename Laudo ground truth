@@ -1,0 +1,21 @@
+{
+  "source_pdf": "laudo_BM-102_2026-07-12.pdf",
+  "numero_laudo": "LT-2026-0347",
+  "data_inspecao": "12/07/2026",
+  "equipamento": "Bomba Centrífuga de Água de Resfriamento",
+  "tag_equipamento": "BM-102",
+  "local_instalacao": "Planta Industrial Sul, Setor de Utilidades, Galpão 3",
+  "inspetor_responsavel": "Carlos Andrade Mendes (CREA-SP 123456)",
+  "tipo_inspecao": "Preditiva (Análise de Vibração)",
+  "normas_referenciadas": ["ISO 10816-3", "ABNT NBR 5462"],
+  "nao_conformidades": [
+    "Vibração acima do limite no mancal traseiro (7,8 mm/s RMS, limite 7,1 mm/s)",
+    "Vazamento leve de óleo lubrificante na base do motor",
+    "Desalinhamento angular de 0,15 mm no acoplamento motor-bomba"
+  ],
+  "criticidade": "Alta",
+  "recomendacoes": "Substituição do rolamento do mancal traseiro em até 15 dias, realinhamento do acoplamento motor-bomba, monitoramento semanal de vibração até normalização",
+  "prazo_correcao": "27/07/2026",
+  "status_equipamento": "Operando com restrição (carga reduzida)",
+  "proxima_inspecao": "12/08/2026"
+}

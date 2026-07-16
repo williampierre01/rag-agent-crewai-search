@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LaudoInspecaoIndustrial",
+  "description": "Campos a extrair de laudos de manutenção/inspeção industrial em texto não estruturado.",
+  "x-data-classification-note": "Todos os campos são dado técnico/operacional sobre equipamento, exceto 'inspetor_responsavel' (marcado com x-lgpd: dado_pessoal), que identifica pessoa natural e está sujeito à LGPD. O pipeline roda 100% local (Qwen2.5 quantizado), sem enviar conteúdo a APIs de terceiros — reduz superfície de exposição desse campo e simplifica conformidade em cenários de transferência internacional de dados (LGPD art. 33).",
+  "type": "object",
+  "properties": {
+    "numero_laudo": {
+      "type": "string",
+      "description": "Identificador único do laudo (ex: 'LT-2026-0347')."
+    },
+    "data_inspecao": {
+      "type": "string",
+      "description": "Data em que a inspeção foi realizada, formato DD/MM/AAAA."
+    },
+    "equipamento": {
+      "type": "string",
+      "description": "Nome/descrição do equipamento inspecionado."
+    },
+    "tag_equipamento": {
+      "type": "string",
+      "description": "Código/TAG de identificação do equipamento na planta (ex: 'BM-102')."
+    },
+    "local_instalacao": {
+      "type": "string",
+      "description": "Planta, setor ou local físico onde o equipamento está instalado."
+    },
+    "inspetor_responsavel": {
+      "type": "string",
+      "description": "Nome (e registro profissional, se houver) de quem assina o laudo.",
+      "x-lgpd": "dado_pessoal"
+    },
+    "tipo_inspecao": {
+      "type": "string",
+      "description": "Categoria da inspeção (ex: preventiva, corretiva, preditiva) e método usado."
+    },
+    "normas_referenciadas": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Normas técnicas citadas no laudo (ex: ISO 10816-3, ABNT NBR)."
+    },
+    "nao_conformidades": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Lista de problemas/desvios identificados na inspeção."
+    },
+    "criticidade": {
+      "type": "string",
+      "enum": ["Baixa", "Média", "Alta", "Crítica"],
+      "description": "Nível de gravidade geral atribuído ao laudo."
+    },
+    "recomendacoes": {
+      "type": "string",
+      "description": "Ações recomendadas pelo inspetor para corrigir as não conformidades."
+    },
+    "prazo_correcao": {
+      "type": "string",
+      "description": "Data limite recomendada para correção, formato DD/MM/AAAA."
+    },
+    "status_equipamento": {
+      "type": "string",
+      "description": "Situação operacional do equipamento após a inspeção (ex: operacional, parado, operando com restrição)."
+    },
+    "proxima_inspecao": {
+      "type": "string",
+      "description": "Data prevista para a próxima inspeção, formato DD/MM/AAAA."
+    }
+  },
+  "required": [
+    "numero_laudo",
+    "data_inspecao",
+    "equipamento",
+    "tag_equipamento",
+    "criticidade",
+    "nao_conformidades"
+  ]
+}

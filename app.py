@@ -1,5 +1,6 @@
 import gradio as gr
 import os
+import json
 import spaces
 import torch
 import gc
@@ -11,6 +12,12 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from langchain_community.retrievers import BM25Retriever
+
+try:
+    from langchain_classic.retrievers.ensemble import EnsembleRetriever
+except ImportError:
+    from langchain.retrievers import EnsembleRetriever
 
 # Imports Transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
@@ -21,10 +28,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 # Apenas a engine (LLM) é global: é cara de carregar (7B em 4-bit) e não
 # depende de dados do usuário, então é seguro compartilhá-la entre sessões.
 #
-# O retriever (índice do PDF) NUNCA deve ser global — cada usuário sobe um
+# O retriever e o texto do documento NUNCA são globais — cada usuário sobe um
 # PDF diferente, e um estado global aqui misturaria documentos entre sessões
-# simultâneas. Ele agora vive em gr.State, por usuário/aba do navegador.
+# simultâneas. Ambos vivem em gr.State, por usuário/aba do navegador.
 GLOBAL_ENGINE = None
+
+SCHEMA_PATH = os.path.join(os.path.dirname(__file__), "laudo_schema.json")
+with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+    LAUDO_SCHEMA = json.load(f)
 
 # ==============================================================================
 #  1. ENGINE CUSTOMIZADA (CORREÇÃO DE TIPOS LIST vs STR)
@@ -42,16 +53,13 @@ class LocalQwenEngine(Model):
         """
         Gera resposta tratando erros de tipo (List vs String) que o smolagents pode enviar.
         """
-        # 1. Limpeza de Argumentos
         clean_kwargs = {
             k: v for k, v in kwargs.items()
             if k not in ['pipeline', 'grammar', 'stop_sequences', 'adapter_id']
         }
 
-        # 2. Conversão e Sanitização de Mensagens
         formatted_messages = []
         for msg in messages:
-            # Identifica Role e Content
             if isinstance(msg, dict):
                 role = msg.get('role', 'user')
                 content = msg.get('content', '')
@@ -59,8 +67,6 @@ class LocalQwenEngine(Model):
                 role = getattr(msg, 'role', 'user')
                 content = getattr(msg, 'content', str(msg))
 
-            # --- CORREÇÃO DO ERRO DE CONCATENAÇÃO ---
-            # Se o conteúdo for uma lista (ex: uso de ferramenta), converte para string
             if isinstance(content, list):
                 content_str = "\n".join([str(item) for item in content])
             else:
@@ -68,7 +74,6 @@ class LocalQwenEngine(Model):
 
             formatted_messages.append({"role": role, "content": content_str})
 
-        # 3. Aplica o template de chat
         try:
             prompt = self.tokenizer.apply_chat_template(
                 formatted_messages,
@@ -76,14 +81,10 @@ class LocalQwenEngine(Model):
                 add_generation_prompt=True
             )
         except Exception:
-            # Fallback de emergência se o template falhar
             prompt = str(formatted_messages)
 
-        # 4. Geração
         # stop_sequences vem do smolagents e é essencial: é como o CodeAgent
-        # sabe onde termina o bloco de código gerado. Sem isso, o modelo pode
-        # continuar gerando texto além do esperado e alucinar a próxima
-        # "observação" da ferramenta como se fosse dele mesmo.
+        # sabe onde termina o bloco de código gerado.
         try:
             outputs = self.pipeline(
                 prompt,
@@ -97,12 +98,25 @@ class LocalQwenEngine(Model):
             )
 
             response_text = outputs[0]["generated_text"]
-
             return ChatMessage(role="assistant", content=response_text)
 
         except Exception as e:
             print(f"Erro na geração: {e}")
             return ChatMessage(role="assistant", content=f"Error: {str(e)}")
+
+    def raw_generate(self, prompt_text: str, max_new_tokens: int = 1024) -> str:
+        """
+        Geração direta (sem o formato de mensagens do smolagents), usada pela
+        extração estruturada — não precisamos do roteamento de agente/ferramentas
+        para isso, só de um prompt único pedindo JSON.
+        """
+        outputs = self.pipeline(
+            prompt_text,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,   # extração quer determinismo, não criatividade
+            temperature=0.0,
+        )
+        return outputs[0]["generated_text"]
 
 # ==============================================================================
 #  2. CARREGAMENTO (SETUP)
@@ -143,7 +157,7 @@ def get_or_create_engine():
     return GLOBAL_ENGINE
 
 # ==============================================================================
-#  3. FERRAMENTAS E AGENTES
+#  3. FERRAMENTAS E AGENTES (CHAT)
 # ==============================================================================
 
 class PDFSearchTool(Tool):
@@ -153,9 +167,6 @@ class PDFSearchTool(Tool):
     output_type = "string"
 
     def __init__(self, retriever):
-        # Recebe o retriever explicitamente (por sessão) em vez de ler de
-        # uma variável global — é isso que impede o vazamento de dados
-        # entre usuários que sobem PDFs diferentes ao mesmo tempo.
         self.retriever = retriever
         super().__init__()
 
@@ -190,7 +201,6 @@ class AgentAsTool(Tool):
 def get_manager_agent(retriever):
     engine = get_or_create_engine()
 
-    # 1. Pesquisador — recebe o retriever da sessão atual
     researcher = CodeAgent(
         tools=[PDFSearchTool(retriever)],
         model=engine,
@@ -199,14 +209,12 @@ def get_manager_agent(retriever):
         description="Reads PDFs."
     )
 
-    # 2. Ferramenta Pesquisador
     researcher_tool = AgentAsTool(
         agent=researcher,
         name="ask_researcher",
         description="Ask the Researcher to find info in the PDF."
     )
 
-    # 3. Gerente
     manager = CodeAgent(
         tools=[researcher_tool],
         model=engine,
@@ -215,38 +223,145 @@ def get_manager_agent(retriever):
     return manager
 
 # ==============================================================================
-#  4. RAG E CHAT
+#  4. RAG — INDEXAÇÃO E RECUPERAÇÃO HÍBRIDA
 # ==============================================================================
-@spaces.GPU
+#  Funções puras (sem decorators, sem estado global) — reusáveis pelo
+#  rag_eval.py sem precisar subir o Gradio nem o LLM.
+# ==============================================================================
+BM25_WEIGHT = 0.4
+VECTOR_WEIGHT = 0.6
+DEFAULT_K = 3
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def load_and_split_pdf(pdf_path, chunk_size=800, chunk_overlap=100):
+    """Carrega o PDF e quebra em chunks. Isolado para ser reusável e testável."""
+    loader = PyPDFLoader(pdf_path)
+    docs = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap
+    )
+    return text_splitter.split_documents(docs)
+
+
+def build_hybrid_retriever(splits, k=DEFAULT_K):
+    """
+    Constrói um retriever híbrido combinando BM25 (lexical/keyword — forte em
+    termos exatos, normas técnicas, códigos de equipamento) com busca vetorial
+    (semântica — forte em paráfrases). O EnsembleRetriever combina os
+    rankings via Reciprocal Rank Fusion.
+    """
+    bm25_retriever = BM25Retriever.from_documents(splits)
+    bm25_retriever.k = k
+
+    embedding_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    vectorstore = Chroma.from_documents(
+        documents=splits,
+        embedding=embedding_model,
+        collection_name="pdf_store",
+        persist_directory=None,
+    )
+    vector_retriever = vectorstore.as_retriever(search_kwargs={"k": k})
+
+    return EnsembleRetriever(
+        retrievers=[bm25_retriever, vector_retriever],
+        weights=[BM25_WEIGHT, VECTOR_WEIGHT],
+    )
+
+
 def build_vector_store(pdf_path):
     """
-    Indexa o PDF e RETORNA o retriever (não seta estado global).
-    Só usa o modelo de embeddings (leve) — a LLM de 7B não é carregada
-    aqui, pois indexação não precisa dela. Isso evita estourar o teto de
-    tempo do ZeroGPU só carregando um modelo que ainda não é necessário.
+    Ponto de entrada usado pelo Gradio. Indexação roda inteiramente em CPU
+    (embeddings leves + BM25) — não precisa de @spaces.GPU aqui, já que a
+    LLM de 7B não é carregada nessa etapa. Retorna (retriever, texto_completo):
+    o texto completo é usado pela extração estruturada (ver seção 5), que
+    precisa ver o documento inteiro de uma vez, não só os top-k chunks de
+    uma busca — extração de campos não é a mesma tarefa que responder 1
+    pergunta pontual.
     """
     print(f"[RAG] Indexando: {pdf_path}")
     try:
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        loader = PyPDFLoader(pdf_path)
-        docs = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-        splits = text_splitter.split_documents(docs)
-        embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-        vectorstore = Chroma.from_documents(
-            documents=splits,
-            embedding=embedding_model,
-            collection_name="pdf_store",
-            persist_directory=None
-        )
-        return vectorstore.as_retriever(search_kwargs={"k": 3})
+        splits = load_and_split_pdf(pdf_path)
+        retriever = build_hybrid_retriever(splits)
+        full_text = "\n\n".join(d.page_content for d in splits)
+        return retriever, full_text
     except Exception as e:
         print(f"Erro: {e}")
-        return None
+        return None, None
 
+# ==============================================================================
+#  5. EXTRAÇÃO ESTRUTURADA (SCHEMA-DRIVEN)
+# ==============================================================================
+def build_extraction_prompt(document_text: str, schema: dict) -> str:
+    fields_desc = "\n".join(
+        f'- "{name}" ({info.get("type")}): {info.get("description", "")}'
+        for name, info in schema.get("properties", {}).items()
+    )
+    required = ", ".join(schema.get("required", []))
+
+    return f"""Você é um extrator de dados técnicos preciso. Sua única tarefa é ler o
+documento abaixo e devolver APENAS um objeto JSON válido com os campos a seguir,
+sem nenhum texto antes ou depois, sem markdown, sem explicações.
+
+CAMPOS A EXTRAIR:
+{fields_desc}
+
+Campos obrigatórios (nunca deixe em branco se a informação existir no texto): {required}
+
+Regras:
+- Se um campo não for encontrado no documento, use null.
+- Para campos do tipo "array", sempre devolva uma lista, mesmo que com 1 item.
+- Não invente valores. Extraia apenas o que está explicitamente no texto.
+- Normalize números (ex: "7,8 mm/s" e "7.8 mm/s" são o mesmo valor).
+
+DOCUMENTO:
+\"\"\"
+{document_text}
+\"\"\"
+
+Responda APENAS com o JSON:"""
+
+
+def parse_extraction_output(raw_text: str) -> dict:
+    """
+    Tenta parsear o JSON da saída do modelo de forma tolerante: o modelo pode
+    (mesmo instruído a não fazer) envolver a resposta em texto ou markdown.
+    """
+    text = raw_text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start:end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    return {"error": "Não foi possível parsear JSON da resposta do modelo.", "raw_output": raw_text}
+
+
+@spaces.GPU(duration=90)
+def extract_fields_function(document_text):
+    if not document_text:
+        return {"error": "Nenhum documento indexado. Faça upload de um PDF primeiro."}
+
+    try:
+        engine = get_or_create_engine()
+        prompt = build_extraction_prompt(document_text, LAUDO_SCHEMA)
+        raw_output = engine.raw_generate(prompt)
+        return parse_extraction_output(raw_output)
+    except Exception as e:
+        print(traceback.format_exc())
+        return {"error": f"Erro na extração: {str(e)}"}
+
+# ==============================================================================
+#  6. CHAT
+# ==============================================================================
 @spaces.GPU(duration=120)
 def chat_function(message, history, retriever):
     if not message:
@@ -280,27 +395,45 @@ def chat_function(message, history, retriever):
 # ==============================================================================
 def process_pdf(file_obj):
     if not file_obj:
-        return "Sem arquivo.", None
-    retriever = build_vector_store(file_obj.name if hasattr(file_obj, 'name') else file_obj)
+        return "Sem arquivo.", None, None
+    pdf_path = file_obj.name if hasattr(file_obj, 'name') else file_obj
+    retriever, full_text = build_vector_store(pdf_path)
     if retriever is None:
-        return "Erro ao indexar.", None
-    return "PDF Pronto! Agentes Ativos.", retriever
+        return "Erro ao indexar.", None, None
+    return "PDF Pronto! Agentes Ativos.", retriever, full_text
 
-with gr.Blocks(title="Multi-Agent RAG · Qwen2.5-7B") as demo:
-    gr.Markdown("# 🤖 Multi-Agent RAG (Qwen 7B Local)")
+with gr.Blocks(title="RAG Industrial · Extração de Laudos Técnicos (Qwen2.5-7B Local)") as demo:
+    gr.Markdown("# 🔧 Extração de Laudos Técnicos Industriais")
+    gr.Markdown(
+        "RAG híbrido (BM25 + vetorial) + extração estruturada, rodando 100% local "
+        "(Qwen2.5-7B em 4-bit) — nenhum dado do documento é enviado a APIs de terceiros."
+    )
 
-    # Estado por sessão/aba — cada usuário tem seu próprio retriever,
+    # Estado por sessão/aba — cada usuário tem seu próprio retriever/texto,
     # sem interferir no de outros usuários conectados ao mesmo Space.
     retriever_state = gr.State(None)
+    doc_text_state = gr.State(None)
 
     with gr.Row():
-        upl = gr.File(label="Upload PDF")
+        upl = gr.File(label="Upload do Laudo (PDF)")
         st = gr.Markdown("...")
-    chat = gr.Chatbot(height=600)
-    msg = gr.Textbox(label="Pergunta")
 
-    upl.change(process_pdf, upl, [st, retriever_state])
+    with gr.Tab("💬 Chat"):
+        chat = gr.Chatbot(height=500)
+        msg = gr.Textbox(label="Pergunta")
+
+    with gr.Tab("📋 Extração Estruturada"):
+        gr.Markdown(
+            "Extrai os campos definidos em `laudo_schema.json` diretamente do documento. "
+            "O campo `inspetor_responsavel` contém dado pessoal (LGPD) — trate a saída "
+            "com o mesmo cuidado que trataria o documento original."
+        )
+        extract_btn = gr.Button("Extrair Dados Estruturados", variant="primary")
+        extract_output = gr.JSON(label="Dados Extraídos")
+
+    upl.change(process_pdf, upl, [st, retriever_state, doc_text_state])
     msg.submit(chat_function, [msg, chat, retriever_state], [chat, msg])
+    extract_btn.click(extract_fields_function, doc_text_state, extract_output)
 
 if __name__ == "__main__":
     demo.launch()
