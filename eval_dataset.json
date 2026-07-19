@@ -1,0 +1,42 @@
+[
+  {
+    "question": "Qual o TAG de identificação do equipamento inspecionado?",
+    "expected_keywords": ["BM-102"]
+  },
+  {
+    "question": "Qual o número deste laudo?",
+    "expected_keywords": ["LT-2026-0347"]
+  },
+  {
+    "question": "Quem foi o responsável técnico pela inspeção?",
+    "expected_keywords": ["Carlos Andrade Mendes"]
+  },
+  {
+    "question": "Qual norma técnica foi usada para avaliar os níveis de vibração?",
+    "expected_keywords": ["ISO 10816-3"]
+  },
+  {
+    "question": "Em qual ponto de medição a vibração ficou acima do limite aceitável?",
+    "expected_keywords": ["mancal traseiro", "7,8"]
+  },
+  {
+    "question": "Foi identificado algum vazamento durante a inspeção?",
+    "expected_keywords": ["vazamento", "óleo"]
+  },
+  {
+    "question": "Qual o nível de criticidade atribuído ao equipamento?",
+    "expected_keywords": ["Alta"]
+  },
+  {
+    "question": "Qual o prazo recomendado para a correção das não conformidades?",
+    "expected_keywords": ["27/07/2026"]
+  },
+  {
+    "question": "Em que situação operacional o equipamento deve permanecer até a correção?",
+    "expected_keywords": ["operando com restrição"]
+  },
+  {
+    "question": "Quando está prevista a próxima inspeção de acompanhamento?",
+    "expected_keywords": ["12/08/2026"]
+  }
+]
