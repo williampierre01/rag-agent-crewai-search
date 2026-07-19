@@ -1,4 +1,4 @@
-Rag eval · PY
+rag eval · PY
 """
 rag_eval.py — Avalia a qualidade da RECUPERAÇÃO de contexto do RAG,
 isolada da geração de texto do LLM.
