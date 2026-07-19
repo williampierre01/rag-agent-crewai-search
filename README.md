@@ -72,8 +72,29 @@ surgiriam ao usar um provedor de LLM hospedado fora do Brasil.
 - `rag_eval.py` — mede a qualidade da **recuperação** (retrieval) isolada do
   LLM: hit-rate, recall de keywords e MRR, comparando vetorial puro vs.
   híbrido. Roda em CPU, sem depender de GPU nem do modelo carregado.
-- `extraction_eval.py` *(próximo passo)* — mede a acurácia campo-a-campo da
-  **extração estruturada** contra um gabarito (`laudo_ground_truth.json`).
+- `extraction_eval.py` — mede a acurácia campo-a-campo da **extração
+  estruturada** contra um gabarito (`laudo_ground_truth.json`). Depende do
+  Space publicado (roda o LLM via API).
+
+### Resultados — recuperação híbrida vs. vetorial puro
+
+Rodado com `rag_eval.py --compare` sobre o laudo sintético
+(`knowledge/laudo_BM-102_2026-07-12.pdf`, 10 perguntas):
+
+| Métrica | Vetorial puro | Híbrido (BM25 + vetorial) | Delta |
+|---|---|---|---|
+| Hit rate | 0.80 | **1.00** | +0.20 |
+| Recall médio de keywords | 0.70 | **1.00** | +0.30 |
+| MRR | 0.6833 | **0.80** | +0.1167 |
+| Latência média | 0.019s | 0.019s | — |
+
+O vetorial puro falhou completamente em 2 das 10 perguntas — ambas pedindo
+um **código exato** ("Qual o número deste laudo?" → `LT-2026-0347`) ou uma
+**palavra categórica curta** ("Qual o nível de criticidade?" → `Alta`).
+Esse é o padrão esperado: embeddings semânticos têm dificuldade em capturar
+significado em tokens isolados/alfanuméricos, enquanto BM25 (busca lexical)
+resolve bem esse caso. A recuperação híbrida corrigiu as duas falhas sem
+custo de latência adicional.
 
 ## Stack
 
